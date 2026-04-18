@@ -26,11 +26,35 @@ logger = logging.getLogger(__name__)
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GLOBAL_TIMEOUT = 120  # seconds
+TIKTOK_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/135.0.0.0 Safari/537.36"
+)
+_openai_client: AsyncOpenAI | None = None
+
+
+def openai_configured() -> bool:
+    return bool(OPENAI_API_KEY.strip())
+
+
+def get_openai_client() -> AsyncOpenAI:
+    global _openai_client
+    if not openai_configured():
+        raise RuntimeError("OPENAI_API_KEY is missing or empty")
+    if _openai_client is None:
+        _openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    return _openai_client
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Attentiq backend starting up")
+    key_prefix = OPENAI_API_KEY[:3] if OPENAI_API_KEY else "<missing>"
+    logger.info(
+        "Attentiq backend starting up | openai_configured=%s | key_prefix=%s",
+        openai_configured(),
+        key_prefix,
+    )
     yield
     logger.info("Attentiq backend shutting down")
 
@@ -43,9 +67,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-
 
 # ── Models ──────────────────────────────────────────────────────────────────
 
@@ -126,6 +147,11 @@ def extract_video(url: str, work_dir: str, max_duration: int) -> dict[str, Any]:
         "extract_flat": False,
         "merge_output_format": "mp4",
         "noplaylist": True,
+        "nocheckcertificate": True,
+        "http_headers": {
+            "User-Agent": TIKTOK_USER_AGENT,
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
@@ -207,6 +233,7 @@ async def transcribe_audio(audio_file: str) -> list[TranscriptSegment]:
     if not audio_file or not os.path.exists(audio_file):
         return []
     try:
+        client = get_openai_client()
         with open(audio_file, "rb") as f:
             response = await client.audio.transcriptions.create(
                 model="whisper-1",
@@ -225,7 +252,7 @@ async def transcribe_audio(audio_file: str) -> list[TranscriptSegment]:
             )
         return segments
     except Exception as exc:
-        logger.warning(f"Transcription failed: {exc}")
+        logger.warning("Transcription failed (%s): %s", type(exc).__name__, exc)
         return []
 
 
@@ -246,6 +273,7 @@ async def analyze_frame(timestamp: int, image_path: str) -> VisualSignal:
     )
 
     try:
+        client = get_openai_client()
         resp = await client.chat.completions.create(
             model="gpt-4o",
             max_tokens=200,
@@ -278,7 +306,12 @@ async def analyze_frame(timestamp: int, image_path: str) -> VisualSignal:
             scene_change=bool(data.get("scene_change", False)),
         )
     except Exception as exc:
-        logger.warning(f"Frame analysis failed at {timestamp}s: {exc}")
+        logger.warning(
+            "Frame analysis failed at %ss (%s): %s",
+            timestamp,
+            type(exc).__name__,
+            exc,
+        )
         return VisualSignal(
             timestamp_seconds=timestamp,
             face_expression="analysis unavailable",
@@ -358,6 +391,7 @@ Respond with ONLY valid JSON (no markdown, no code block) with this exact struct
 }}"""
 
     try:
+        client = get_openai_client()
         resp = await client.chat.completions.create(
             model="gpt-4o",
             max_tokens=1000,
@@ -391,7 +425,11 @@ Respond with ONLY valid JSON (no markdown, no code block) with this exact struct
             corrective_actions=[str(a) for a in (data.get("corrective_actions") or [])],
         )
     except Exception as exc:
-        logger.error(f"Diagnostic generation failed: {exc}")
+        logger.error(
+            "Diagnostic generation failed (%s): %s",
+            type(exc).__name__,
+            exc,
+        )
         return Diagnostic(
             retention_score=5.0,
             global_summary="Diagnostic generation encountered an error.",
@@ -422,6 +460,14 @@ async def analyze(req: AnalyzeRequest):
                 None, extract_video, req.url, work_dir, req.max_duration_seconds
             )
             video_file = video_info["video_file"]
+            video_size = os.path.getsize(video_file) if os.path.exists(video_file) else 0
+            logger.info(
+                "[%s] Download complete | video_file=%s | exists=%s | size_bytes=%s",
+                req.request_id,
+                video_file,
+                os.path.exists(video_file),
+                video_size,
+            )
 
             metadata = Metadata(
                 url=req.url,
@@ -437,10 +483,25 @@ async def analyze(req: AnalyzeRequest):
             audio_file = await loop.run_in_executor(
                 None, extract_audio, video_file, work_dir
             )
+            audio_exists = bool(audio_file and os.path.exists(audio_file))
+            audio_size = os.path.getsize(audio_file) if audio_exists else 0
+            logger.info(
+                "[%s] Step 3 prep | audio_file=%s | exists=%s | size_bytes=%s",
+                req.request_id,
+                audio_file or "<missing>",
+                audio_exists,
+                audio_size,
+            )
 
             logger.info(f"[{req.request_id}] Step 3: Transcribing audio")
             try:
                 transcript = await transcribe_audio(audio_file)
+                if audio_exists and not transcript:
+                    logger.warning(
+                        "[%s] Whisper returned no segments despite audio file existing",
+                        req.request_id,
+                    )
+                    status = "partial"
             except Exception as exc:
                 logger.warning(f"[{req.request_id}] Transcript failed: {exc}")
                 transcript = []
@@ -450,6 +511,17 @@ async def analyze(req: AnalyzeRequest):
             logger.info(f"[{req.request_id}] Step 4: Extracting frames")
             frames = await loop.run_in_executor(
                 None, extract_frames, video_file, work_dir, 5
+            )
+            first_frame = frames[0][1] if frames else ""
+            first_frame_exists = bool(first_frame and os.path.exists(first_frame))
+            first_frame_size = os.path.getsize(first_frame) if first_frame_exists else 0
+            logger.info(
+                "[%s] Step 5 prep | frames=%s | first_frame=%s | first_frame_exists=%s | first_frame_size_bytes=%s",
+                req.request_id,
+                len(frames),
+                first_frame or "<missing>",
+                first_frame_exists,
+                first_frame_size,
             )
 
             # 4. Analyze frames with GPT-4o Vision (concurrently)
@@ -466,10 +538,26 @@ async def analyze(req: AnalyzeRequest):
 
             # Sort by timestamp
             visual_signals.sort(key=lambda x: x.timestamp_seconds)
+            unavailable_frames = sum(
+                1
+                for signal in visual_signals
+                if signal.face_expression == "analysis unavailable"
+                and signal.body_position == "analysis unavailable"
+            )
+            if unavailable_frames:
+                logger.warning(
+                    "[%s] Vision unavailable on %s/%s frames",
+                    req.request_id,
+                    unavailable_frames,
+                    len(visual_signals),
+                )
+                status = "partial"
 
             # 5. Generate diagnostic
             logger.info(f"[{req.request_id}] Step 6: Generating diagnostic")
             diagnostic = await generate_diagnostic(metadata, transcript, visual_signals)
+            if diagnostic.global_summary == "Diagnostic generation encountered an error.":
+                status = "partial"
 
             processing_time = round(time.time() - start_time, 2)
             logger.info(f"[{req.request_id}] Done in {processing_time}s, status={status}")
