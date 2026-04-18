@@ -1,4 +1,5 @@
-import os, uuid, asyncio, tempfile, subprocess, base64, time, requests
+import os, uuid, asyncio, tempfile, subprocess, base64, time
+import httpx
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -25,15 +26,25 @@ def health():
     return {"status": "ok"}
 
 
-def download_tiktok_via_rapidapi(tiktok_url: str) -> str:
-    api_url = "https://tiktok-download-without-watermark.p.rapidapi.com/analysis"
-    headers = {
-        "X-RapidAPI-Key": RAPIDAPI_KEY,
-        "X-RapidAPI-Host": "tiktok-download-without-watermark.p.rapidapi.com"
-    }
-    params = {"url": tiktok_url, "hd": "0"}
+async def download_tiktok_via_rapidapi(tiktok_url: str) -> str:
+    # Resolve short URL if necessary
+    if "vt.tiktok.com" in tiktok_url or len(tiktok_url) < 60:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            r = await client.head(tiktok_url)
+            tiktok_url = str(r.url)
 
-    response = requests.get(api_url, headers=headers, params=params, timeout=30)
+    headers = {
+        "x-rapidapi-host": "tiktok-download-video-no-watermark.p.rapidapi.com",
+        "x-rapidapi-key": RAPIDAPI_KEY,
+    }
+    params = {"url": tiktok_url, "hd": "1"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            "https://tiktok-download-video-no-watermark.p.rapidapi.com/tiktok/info",
+            headers=headers,
+            params=params,
+        )
     response.raise_for_status()
     data = response.json()
 
@@ -48,13 +59,13 @@ def download_tiktok_via_rapidapi(tiktok_url: str) -> str:
     if not video_url:
         raise ValueError(f"Impossible d'extraire l'URL MP4 depuis RapidAPI. Réponse: {data}")
 
-    mp4_response = requests.get(video_url, stream=True, timeout=60)
-    mp4_response.raise_for_status()
-
     local_path = f"/tmp/{uuid.uuid4()}.mp4"
-    with open(local_path, "wb") as f:
-        for chunk in mp4_response.iter_content(chunk_size=8192):
-            f.write(chunk)
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+        async with client.stream("GET", video_url) as mp4_response:
+            mp4_response.raise_for_status()
+            with open(local_path, "wb") as f:
+                async for chunk in mp4_response.aiter_bytes(chunk_size=8192):
+                    f.write(chunk)
 
     file_size = os.path.getsize(local_path)
     if file_size < 10000:
@@ -174,7 +185,7 @@ async def run_pipeline(job_id: str, request: AnalyzeRequest):
         jobs[job_id]["progress"] = "downloading"
         jobs[job_id]["message"] = "Téléchargement de la vidéo via RapidAPI..."
         loop = asyncio.get_event_loop()
-        mp4_path = await loop.run_in_executor(None, download_tiktok_via_rapidapi, request.url)
+        mp4_path = await download_tiktok_via_rapidapi(request.url)
 
         jobs[job_id]["progress"] = "transcribing"
         jobs[job_id]["message"] = "Transcription audio via Whisper..."

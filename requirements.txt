@@ -5,4 +5,3 @@ yt-dlp==2025.6.9
 httpx==0.28.1
 pydantic==2.10.3
 python-multipart==0.0.20
-requests==2.32.3
