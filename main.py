@@ -585,3 +585,10 @@ async def analyze(req: AnalyzeRequest):
             shutil.rmtree(work_dir, ignore_errors=True)
         except Exception:
             pass
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, workers=2, timeout_keep_alive=130)
