@@ -28,12 +28,46 @@ logger = logging.getLogger(__name__)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GLOBAL_TIMEOUT = 120  # seconds
 
-# Mobile iOS UA — best bypass rate for TikTok datacenter blocks
-TIKTOK_MOBILE_UA = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-    "Version/17.0 Mobile/15E148 Safari/604.1"
-)
+# User-Agent pool — rotated across retries to evade TikTok fingerprinting
+TIKTOK_USER_AGENTS = [
+    # iOS Safari (best bypass rate for datacenter IPs)
+    (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+        "Version/17.4 Mobile/15E148 Safari/604.1"
+    ),
+    # Android Chrome
+    (
+        "Mozilla/5.0 (Linux; Android 14; Pixel 8) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Mobile Safari/537.36"
+    ),
+    # Desktop Chrome
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.6367.82 Safari/537.36"
+    ),
+    # Desktop Firefox
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) "
+        "Gecko/20100101 Firefox/125.0"
+    ),
+]
+
+# Primary mobile UA (kept for backward-compat references)
+TIKTOK_MOBILE_UA = TIKTOK_USER_AGENTS[0]
+
+# TikTok mobile API hostnames tried in order
+TIKTOK_API_HOSTNAMES = [
+    "api22-normal-c-useast2a.tiktokv.com",
+    "api16-normal-c-useast1a.tiktokv.com",
+    "api19-normal-c-useast1a.tiktokv.com",
+]
+
+# Retry configuration
+YTDLP_MAX_RETRIES = 3
+YTDLP_RETRY_BASE_DELAY = 2.0  # seconds; delay doubles each attempt
 
 _openai_client: AsyncOpenAI | None = None
 
@@ -171,31 +205,57 @@ def extract_tiktok_video_id(url: str) -> Optional[str]:
 async def fetch_tiktok_mobile_api(video_id: str) -> Optional[str]:
     """
     Attempt to get a direct video download URL via TikTok's mobile API.
-    Returns a direct mp4 URL or None on failure.
+
+    Tries all TIKTOK_API_HOSTNAMES in order, rotating the User-Agent on
+    each attempt and using realistic mobile-app headers.  Returns the first
+    working mp4 URL, or None if every endpoint fails.
     """
     endpoints = [
-        f"https://api16-normal-c-useast1a.tiktokv.com/aweme/v1/feed/?aweme_id={video_id}",
-        f"https://api22-normal-c-useast2a.tiktokv.com/aweme/v1/feed/?aweme_id={video_id}",
+        f"https://{host}/aweme/v1/feed/?aweme_id={video_id}"
+        for host in TIKTOK_API_HOSTNAMES
     ]
-    headers = {
-        "User-Agent": TIKTOK_MOBILE_UA,
-        "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.5",
-    }
+
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-        for endpoint in endpoints:
+        for idx, endpoint in enumerate(endpoints):
+            user_agent = TIKTOK_USER_AGENTS[idx % len(TIKTOK_USER_AGENTS)]
+            headers = {
+                "User-Agent": user_agent,
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Referer": "https://www.tiktok.com/",
+                "Origin": "https://www.tiktok.com",
+                "Connection": "keep-alive",
+            }
             try:
+                logger.info(
+                    "Mobile API attempt %d/%d | endpoint=%s | ua=%s...",
+                    idx + 1,
+                    len(endpoints),
+                    endpoint,
+                    user_agent[:40],
+                )
                 resp = await client.get(endpoint, headers=headers)
                 if resp.status_code == 200:
                     data = resp.json()
                     aweme_list = data.get("aweme_list") or []
                     if aweme_list:
                         video = aweme_list[0].get("video") or {}
-                        play_addr = video.get("play_addr") or {}
-                        url_list = play_addr.get("url_list") or []
-                        if url_list:
-                            logger.info("Mobile API returned video URL from %s", endpoint)
-                            return url_list[0]
+                        # Prefer no-watermark URL when available
+                        for addr_key in ("play_addr_h264", "play_addr", "download_addr"):
+                            play_addr = video.get(addr_key) or {}
+                            url_list = play_addr.get("url_list") or []
+                            if url_list:
+                                logger.info(
+                                    "Mobile API returned video URL from %s (key=%s)",
+                                    endpoint,
+                                    addr_key,
+                                )
+                                return url_list[0]
+                else:
+                    logger.warning(
+                        "Mobile API endpoint %s returned HTTP %s", endpoint, resp.status_code
+                    )
             except Exception as exc:
                 logger.warning("Mobile API endpoint %s failed: %s", endpoint, exc)
                 continue
@@ -227,9 +287,9 @@ async def download_from_url(direct_url: str, work_dir: str, request_id: str) -> 
 
 # ── Pipeline steps ────────────────────────────────────────────────────────────
 
-def extract_video(url: str, work_dir: str, max_duration: int) -> dict[str, Any]:
-    """Download video + metadata via yt-dlp with enhanced TikTok bypass headers."""
-    ydl_opts = {
+def _build_ydl_opts(work_dir: str, user_agent: str, api_hostname: str) -> dict[str, Any]:
+    """Build yt-dlp options for a single attempt with the given UA and API hostname."""
+    return {
         "format": "best[ext=mp4]/best",
         "outtmpl": os.path.join(work_dir, "video.%(ext)s"),
         "quiet": False,
@@ -238,30 +298,31 @@ def extract_video(url: str, work_dir: str, max_duration: int) -> dict[str, Any]:
         "merge_output_format": "mp4",
         "noplaylist": True,
         "nocheckcertificate": True,
-        # iOS mobile UA — avoids datacenter-IP blocks on TikTok
+        "socket_timeout": 30,
         "http_headers": {
-            "User-Agent": TIKTOK_MOBILE_UA,
+            "User-Agent": user_agent,
             "Referer": "https://www.tiktok.com/",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Language": "en-US,en;q=0.9,en-GB;q=0.8",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
         },
-        # TikTok-specific extractor args — use mobile API hostname
         "extractor_args": {
             "tiktok": {
-                "api_hostname": "api22-normal-c-useast2a.tiktokv.com",
+                "api_hostname": api_hostname,
                 "app_name": "trill",
             }
         },
         "cookiefile": None,
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(url, download=True)
-        except yt_dlp.utils.DownloadError as exc:
-            raise HTTPException(status_code=404, detail=f"VIDEO_UNAVAILABLE: {exc}")
 
+
+def _parse_video_info(info: dict, work_dir: str, max_duration: int) -> dict[str, Any]:
+    """Validate duration, locate the downloaded file, and build the result dict."""
     duration = info.get("duration") or 0
     if duration > max_duration:
         raise HTTPException(
@@ -269,7 +330,6 @@ def extract_video(url: str, work_dir: str, max_duration: int) -> dict[str, Any]:
             detail=f"DURATION_EXCEEDED: video is {duration}s, limit is {max_duration}s",
         )
 
-    # Find the actual file
     video_file = None
     for f in Path(work_dir).iterdir():
         if f.suffix in {".mp4", ".mkv", ".webm", ".mov"}:
@@ -282,10 +342,7 @@ def extract_video(url: str, work_dir: str, max_duration: int) -> dict[str, Any]:
     tags = info.get("tags") or []
     description = info.get("description") or ""
     for tag in tags:
-        if not tag.startswith("#"):
-            hashtags.append(f"#{tag}")
-        else:
-            hashtags.append(tag)
+        hashtags.append(tag if tag.startswith("#") else f"#{tag}")
     for word in description.split():
         if word.startswith("#") and word not in hashtags:
             hashtags.append(word)
@@ -301,54 +358,169 @@ def extract_video(url: str, work_dir: str, max_duration: int) -> dict[str, Any]:
     }
 
 
-def extract_metadata_only(url: str, max_duration: int) -> dict[str, Any]:
-    """Extract only metadata (no download) as a last-resort fallback."""
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": False,
-        "noplaylist": True,
-        "skip_download": True,
-        "http_headers": {
-            "User-Agent": TIKTOK_MOBILE_UA,
-            "Referer": "https://www.tiktok.com/",
-            "Accept-Language": "en-US,en;q=0.5",
-        },
-        "extractor_args": {
-            "tiktok": {
-                "api_hostname": "api22-normal-c-useast2a.tiktokv.com",
-                "app_name": "trill",
-            }
-        },
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(url, download=False)
-        except yt_dlp.utils.DownloadError as exc:
-            raise HTTPException(status_code=404, detail=f"VIDEO_UNAVAILABLE: {exc}")
+def extract_video(url: str, work_dir: str, max_duration: int) -> dict[str, Any]:
+    """
+    Download video + metadata via yt-dlp.
 
-    duration = info.get("duration") or 0
-    if duration > max_duration:
-        raise HTTPException(
-            status_code=400,
-            detail=f"DURATION_EXCEEDED: video is {duration}s, limit is {max_duration}s",
+    Retries up to YTDLP_MAX_RETRIES times, rotating the User-Agent and
+    TikTok API hostname on each attempt with exponential back-off.
+    Raises HTTPException(404/400) for hard failures; raises the last
+    DownloadError for soft failures so the caller can try other strategies.
+    """
+    last_exc: Exception | None = None
+
+    for attempt in range(YTDLP_MAX_RETRIES):
+        user_agent = TIKTOK_USER_AGENTS[attempt % len(TIKTOK_USER_AGENTS)]
+        api_hostname = TIKTOK_API_HOSTNAMES[attempt % len(TIKTOK_API_HOSTNAMES)]
+
+        logger.info(
+            "yt-dlp attempt %d/%d | ua=%s... | api_host=%s",
+            attempt + 1,
+            YTDLP_MAX_RETRIES,
+            user_agent[:40],
+            api_hostname,
         )
 
-    hashtags: list[str] = []
-    for tag in (info.get("tags") or []):
-        hashtags.append(f"#{tag}" if not tag.startswith("#") else tag)
-    for word in (info.get("description") or "").split():
-        if word.startswith("#") and word not in hashtags:
-            hashtags.append(word)
-    hashtags = hashtags[:10]
+        ydl_opts = _build_ydl_opts(work_dir, user_agent, api_hostname)
 
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+            return _parse_video_info(info, work_dir, max_duration)
+
+        except HTTPException:
+            # Duration/file errors — propagate immediately, no point retrying
+            raise
+
+        except yt_dlp.utils.DownloadError as exc:
+            err_str = str(exc).lower()
+            # Hard failures: video is gone / private / geo-blocked
+            if any(k in err_str for k in ("private", "removed", "not available", "geo")):
+                raise HTTPException(status_code=404, detail=f"VIDEO_UNAVAILABLE: {exc}")
+
+            last_exc = exc
+            delay = YTDLP_RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(
+                "yt-dlp attempt %d failed (%s) — retrying in %.1fs",
+                attempt + 1,
+                exc,
+                delay,
+            )
+            if attempt < YTDLP_MAX_RETRIES - 1:
+                time.sleep(delay)
+
+        except Exception as exc:
+            last_exc = exc
+            delay = YTDLP_RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(
+                "yt-dlp attempt %d unexpected error (%s) — retrying in %.1fs",
+                attempt + 1,
+                exc,
+                delay,
+            )
+            if attempt < YTDLP_MAX_RETRIES - 1:
+                time.sleep(delay)
+
+    # All retries exhausted — raise so the caller can try mobile API fallback
+    raise yt_dlp.utils.DownloadError(
+        f"yt-dlp failed after {YTDLP_MAX_RETRIES} attempts: {last_exc}"
+    )
+
+
+def extract_metadata_only(url: str, max_duration: int) -> dict[str, Any]:
+    """
+    Extract only metadata (no download) as a last-resort fallback.
+
+    Tries each UA / API hostname combination so we maximise the chance of
+    getting at least title/author/duration even when video download is blocked.
+    Returns a result dict with video_file=None and an 'extraction_error' key
+    so the caller can surface the failure reason in debug_info.
+    """
+    last_exc: Exception | None = None
+
+    for attempt in range(len(TIKTOK_USER_AGENTS)):
+        user_agent = TIKTOK_USER_AGENTS[attempt % len(TIKTOK_USER_AGENTS)]
+        api_hostname = TIKTOK_API_HOSTNAMES[attempt % len(TIKTOK_API_HOSTNAMES)]
+
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": False,
+            "noplaylist": True,
+            "skip_download": True,
+            "socket_timeout": 20,
+            "http_headers": {
+                "User-Agent": user_agent,
+                "Referer": "https://www.tiktok.com/",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+            },
+            "extractor_args": {
+                "tiktok": {
+                    "api_hostname": api_hostname,
+                    "app_name": "trill",
+                }
+            },
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+
+            duration = info.get("duration") or 0
+            if duration > max_duration:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"DURATION_EXCEEDED: video is {duration}s, limit is {max_duration}s",
+                )
+
+            hashtags: list[str] = []
+            for tag in (info.get("tags") or []):
+                hashtags.append(tag if tag.startswith("#") else f"#{tag}")
+            for word in (info.get("description") or "").split():
+                if word.startswith("#") and word not in hashtags:
+                    hashtags.append(word)
+            hashtags = hashtags[:10]
+
+            return {
+                "video_file": None,
+                "duration": duration,
+                "author": info.get("uploader") or info.get("channel") or "unknown",
+                "title": info.get("title") or "",
+                "hashtags": hashtags,
+                "info": info,
+                "extraction_error": None,
+            }
+
+        except HTTPException:
+            raise
+
+        except yt_dlp.utils.DownloadError as exc:
+            err_str = str(exc).lower()
+            if any(k in err_str for k in ("private", "removed", "not available", "geo")):
+                raise HTTPException(status_code=404, detail=f"VIDEO_UNAVAILABLE: {exc}")
+            last_exc = exc
+            logger.warning(
+                "metadata-only attempt %d failed (%s)", attempt + 1, exc
+            )
+
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "metadata-only attempt %d unexpected error (%s)", attempt + 1, exc
+            )
+
+    # All attempts failed — return a minimal stub so the pipeline can still
+    # produce a metadata_only response with error details rather than a 500.
+    logger.error("extract_metadata_only exhausted all attempts: %s", last_exc)
     return {
         "video_file": None,
-        "duration": duration,
-        "author": info.get("uploader") or info.get("channel") or "unknown",
-        "title": info.get("title") or "",
-        "hashtags": hashtags,
-        "info": info,
+        "duration": 0,
+        "author": "unknown",
+        "title": "",
+        "hashtags": [],
+        "info": {},
+        "extraction_error": str(last_exc),
     }
 
 
@@ -681,6 +853,16 @@ async def analyze(req: AnalyzeRequest):
                     video_info = await loop.run_in_executor(
                         None, extract_metadata_only, req.url, req.max_duration_seconds
                     )
+                    # Surface extraction_error in debug_info when all methods failed
+                    extraction_error = video_info.get("extraction_error")
+                    if extraction_error:
+                        logger.error(
+                            "[%s] All extraction methods failed: %s",
+                            req.request_id,
+                            extraction_error,
+                        )
+                        if not debug_info.ytdlp_error:
+                            debug_info.ytdlp_error = extraction_error
                 except HTTPException:
                     raise
                 except Exception as exc:
