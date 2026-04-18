@@ -6,6 +6,7 @@ import base64
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -26,11 +27,14 @@ logger = logging.getLogger(__name__)
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GLOBAL_TIMEOUT = 120  # seconds
-TIKTOK_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/135.0.0.0 Safari/537.36"
+
+# Mobile iOS UA — best bypass rate for TikTok datacenter blocks
+TIKTOK_MOBILE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.0 Mobile/15E148 Safari/604.1"
 )
+
 _openai_client: AsyncOpenAI | None = None
 
 
@@ -118,14 +122,25 @@ class Metadata(BaseModel):
     hashtags: list[str]
 
 
+class DebugInfo(BaseModel):
+    download_method: str  # "ytdlp" | "tiktok_mobile_api" | "failed"
+    video_size_bytes: int
+    audio_size_bytes: int
+    frame_count: int
+    ytdlp_error: Optional[str] = None
+    mobile_api_error: Optional[str] = None
+
+
 class AnalyzeResponse(BaseModel):
     request_id: str
     status: str  # success|partial|error
+    analysis_type: str  # "full_analysis" | "metadata_only"
     metadata: Metadata
     transcript: list[TranscriptSegment]
     visual_signals: list[VisualSignal]
     diagnostic: Diagnostic
     processing_time_seconds: float
+    debug_info: DebugInfo
 
 
 # ── Health ───────────────────────────────────────────────────────────────────
@@ -135,23 +150,111 @@ async def health():
     return {"status": "ok", "service": "attentiq-backend"}
 
 
+# ── TikTok video_id extraction ───────────────────────────────────────────────
+
+def extract_tiktok_video_id(url: str) -> Optional[str]:
+    """Extract video ID from a TikTok URL."""
+    patterns = [
+        r"/video/(\d+)",
+        r"vm\.tiktok\.com/(\w+)",
+        r"vt\.tiktok\.com/(\w+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
+# ── Mobile TikTok API fallback ───────────────────────────────────────────────
+
+async def fetch_tiktok_mobile_api(video_id: str) -> Optional[str]:
+    """
+    Attempt to get a direct video download URL via TikTok's mobile API.
+    Returns a direct mp4 URL or None on failure.
+    """
+    endpoints = [
+        f"https://api16-normal-c-useast1a.tiktokv.com/aweme/v1/feed/?aweme_id={video_id}",
+        f"https://api22-normal-c-useast2a.tiktokv.com/aweme/v1/feed/?aweme_id={video_id}",
+    ]
+    headers = {
+        "User-Agent": TIKTOK_MOBILE_UA,
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        for endpoint in endpoints:
+            try:
+                resp = await client.get(endpoint, headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    aweme_list = data.get("aweme_list") or []
+                    if aweme_list:
+                        video = aweme_list[0].get("video") or {}
+                        play_addr = video.get("play_addr") or {}
+                        url_list = play_addr.get("url_list") or []
+                        if url_list:
+                            logger.info("Mobile API returned video URL from %s", endpoint)
+                            return url_list[0]
+            except Exception as exc:
+                logger.warning("Mobile API endpoint %s failed: %s", endpoint, exc)
+                continue
+    return None
+
+
+async def download_from_url(direct_url: str, work_dir: str, request_id: str) -> Optional[str]:
+    """Download a direct video URL to disk. Returns path to saved file or None."""
+    dest = os.path.join(work_dir, "video.mp4")
+    headers = {
+        "User-Agent": TIKTOK_MOBILE_UA,
+        "Referer": "https://www.tiktok.com/",
+        "Accept": "*/*",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            async with client.stream("GET", direct_url, headers=headers) as resp:
+                resp.raise_for_status()
+                with open(dest, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        f.write(chunk)
+        size = os.path.getsize(dest)
+        logger.info("[%s] Mobile API download complete | size_bytes=%s", request_id, size)
+        return dest if size > 0 else None
+    except Exception as exc:
+        logger.warning("[%s] Direct download failed: %s", request_id, exc)
+        return None
+
+
 # ── Pipeline steps ────────────────────────────────────────────────────────────
 
 def extract_video(url: str, work_dir: str, max_duration: int) -> dict[str, Any]:
-    """Download video + metadata via yt-dlp. Returns info dict."""
+    """Download video + metadata via yt-dlp with enhanced TikTok bypass headers."""
     ydl_opts = {
-        "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "format": "best[ext=mp4]/best",
         "outtmpl": os.path.join(work_dir, "video.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
+        "quiet": False,
+        "no_warnings": False,
         "extract_flat": False,
         "merge_output_format": "mp4",
         "noplaylist": True,
         "nocheckcertificate": True,
+        # iOS mobile UA — avoids datacenter-IP blocks on TikTok
         "http_headers": {
-            "User-Agent": TIKTOK_USER_AGENT,
-            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": TIKTOK_MOBILE_UA,
+            "Referer": "https://www.tiktok.com/",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
         },
+        # TikTok-specific extractor args — use mobile API hostname
+        "extractor_args": {
+            "tiktok": {
+                "api_hostname": "api22-normal-c-useast2a.tiktokv.com",
+                "app_name": "trill",
+            }
+        },
+        "cookiefile": None,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
@@ -178,20 +281,69 @@ def extract_video(url: str, work_dir: str, max_duration: int) -> dict[str, Any]:
     hashtags: list[str] = []
     tags = info.get("tags") or []
     description = info.get("description") or ""
-    # Extract hashtags from tags or description
     for tag in tags:
         if not tag.startswith("#"):
             hashtags.append(f"#{tag}")
         else:
             hashtags.append(tag)
-    # Also parse description
     for word in description.split():
         if word.startswith("#") and word not in hashtags:
             hashtags.append(word)
-    hashtags = hashtags[:10]  # cap at 10
+    hashtags = hashtags[:10]
 
     return {
         "video_file": video_file,
+        "duration": duration,
+        "author": info.get("uploader") or info.get("channel") or "unknown",
+        "title": info.get("title") or "",
+        "hashtags": hashtags,
+        "info": info,
+    }
+
+
+def extract_metadata_only(url: str, max_duration: int) -> dict[str, Any]:
+    """Extract only metadata (no download) as a last-resort fallback."""
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": False,
+        "noplaylist": True,
+        "skip_download": True,
+        "http_headers": {
+            "User-Agent": TIKTOK_MOBILE_UA,
+            "Referer": "https://www.tiktok.com/",
+            "Accept-Language": "en-US,en;q=0.5",
+        },
+        "extractor_args": {
+            "tiktok": {
+                "api_hostname": "api22-normal-c-useast2a.tiktokv.com",
+                "app_name": "trill",
+            }
+        },
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(url, download=False)
+        except yt_dlp.utils.DownloadError as exc:
+            raise HTTPException(status_code=404, detail=f"VIDEO_UNAVAILABLE: {exc}")
+
+    duration = info.get("duration") or 0
+    if duration > max_duration:
+        raise HTTPException(
+            status_code=400,
+            detail=f"DURATION_EXCEEDED: video is {duration}s, limit is {max_duration}s",
+        )
+
+    hashtags: list[str] = []
+    for tag in (info.get("tags") or []):
+        hashtags.append(f"#{tag}" if not tag.startswith("#") else tag)
+    for word in (info.get("description") or "").split():
+        if word.startswith("#") and word not in hashtags:
+            hashtags.append(word)
+    hashtags = hashtags[:10]
+
+    return {
+        "video_file": None,
         "duration": duration,
         "author": info.get("uploader") or info.get("channel") or "unknown",
         "title": info.get("title") or "",
@@ -448,26 +600,96 @@ async def analyze(req: AnalyzeRequest):
     start_time = time.time()
     work_dir = tempfile.mkdtemp(prefix="attentiq_")
     status = "success"
+    analysis_type = "full_analysis"
+    debug_info = DebugInfo(
+        download_method="failed",
+        video_size_bytes=0,
+        audio_size_bytes=0,
+        frame_count=0,
+    )
 
     try:
         async with asyncio.timeout(GLOBAL_TIMEOUT):
             logger.info(f"[{req.request_id}] Starting analysis of {req.url}")
 
-            # 1. Extract video
-            logger.info(f"[{req.request_id}] Step 1: Extracting video")
+            # ── Step 1: Download video (yt-dlp with enhanced TikTok headers) ───
+            logger.info(f"[{req.request_id}] Step 1: Extracting video via yt-dlp")
             loop = asyncio.get_event_loop()
-            video_info = await loop.run_in_executor(
-                None, extract_video, req.url, work_dir, req.max_duration_seconds
-            )
-            video_file = video_info["video_file"]
-            video_size = os.path.getsize(video_file) if os.path.exists(video_file) else 0
-            logger.info(
-                "[%s] Download complete | video_file=%s | exists=%s | size_bytes=%s",
-                req.request_id,
-                video_file,
-                os.path.exists(video_file),
-                video_size,
-            )
+            video_file: Optional[str] = None
+            video_info: Optional[dict] = None
+            ytdlp_error: Optional[str] = None
+
+            try:
+                video_info = await loop.run_in_executor(
+                    None, extract_video, req.url, work_dir, req.max_duration_seconds
+                )
+                video_file = video_info["video_file"]
+                video_size = os.path.getsize(video_file) if video_file and os.path.exists(video_file) else 0
+                logger.info(
+                    "[%s] yt-dlp download complete | size_bytes=%s",
+                    req.request_id,
+                    video_size,
+                )
+                debug_info.download_method = "ytdlp"
+                debug_info.video_size_bytes = video_size
+            except HTTPException as exc:
+                # Re-raise 404/400 immediately (video unavailable or too long)
+                if exc.status_code in (404, 400):
+                    raise
+                ytdlp_error = str(exc.detail)
+                logger.warning("[%s] yt-dlp failed: %s", req.request_id, ytdlp_error)
+            except Exception as exc:
+                ytdlp_error = str(exc)
+                logger.warning("[%s] yt-dlp failed: %s", req.request_id, ytdlp_error)
+                debug_info.ytdlp_error = ytdlp_error
+
+            # ── Step 1b: Mobile TikTok API fallback ──────────────────────────
+            if not video_file and "tiktok" in req.url.lower():
+                logger.info("[%s] Trying mobile TikTok API fallback", req.request_id)
+                video_id = extract_tiktok_video_id(req.url)
+                mobile_error: Optional[str] = None
+
+                if video_id:
+                    try:
+                        direct_url = await fetch_tiktok_mobile_api(video_id)
+                        if direct_url:
+                            video_file = await download_from_url(direct_url, work_dir, req.request_id)
+                            if video_file:
+                                video_size = os.path.getsize(video_file)
+                                debug_info.download_method = "tiktok_mobile_api"
+                                debug_info.video_size_bytes = video_size
+                                logger.info(
+                                    "[%s] Mobile API fallback succeeded | size_bytes=%s",
+                                    req.request_id,
+                                    video_size,
+                                )
+                        else:
+                            mobile_error = "Mobile API returned no video URL"
+                    except Exception as exc:
+                        mobile_error = str(exc)
+                        logger.warning("[%s] Mobile API fallback failed: %s", req.request_id, exc)
+                else:
+                    mobile_error = "Could not extract video_id from URL"
+
+                if mobile_error:
+                    debug_info.mobile_api_error = mobile_error
+
+            # ── Step 1c: Metadata-only fallback (last resort) ────────────────
+            if not video_info:
+                logger.info("[%s] Falling back to metadata-only extraction", req.request_id)
+                try:
+                    video_info = await loop.run_in_executor(
+                        None, extract_metadata_only, req.url, req.max_duration_seconds
+                    )
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    raise HTTPException(status_code=500, detail=f"INTERNAL_ERROR: {exc}")
+
+            if not video_file:
+                analysis_type = "metadata_only"
+                status = "partial"
+                logger.warning("[%s] No video file — metadata_only mode", req.request_id)
 
             metadata = Metadata(
                 url=req.url,
@@ -478,25 +700,28 @@ async def analyze(req: AnalyzeRequest):
                 hashtags=video_info["hashtags"],
             )
 
-            # 2. Extract audio + transcribe (async)
-            logger.info(f"[{req.request_id}] Step 2: Extracting audio")
-            audio_file = await loop.run_in_executor(
-                None, extract_audio, video_file, work_dir
-            )
-            audio_exists = bool(audio_file and os.path.exists(audio_file))
-            audio_size = os.path.getsize(audio_file) if audio_exists else 0
-            logger.info(
-                "[%s] Step 3 prep | audio_file=%s | exists=%s | size_bytes=%s",
-                req.request_id,
-                audio_file or "<missing>",
-                audio_exists,
-                audio_size,
-            )
+            # ── Step 2: Extract audio ─────────────────────────────────────────
+            audio_file = ""
+            if video_file:
+                logger.info(f"[{req.request_id}] Step 2: Extracting audio")
+                audio_file = await loop.run_in_executor(
+                    None, extract_audio, video_file, work_dir
+                )
+                audio_exists = bool(audio_file and os.path.exists(audio_file))
+                audio_size = os.path.getsize(audio_file) if audio_exists else 0
+                debug_info.audio_size_bytes = audio_size
+                logger.info(
+                    "[%s] Audio | exists=%s | size_bytes=%s",
+                    req.request_id,
+                    audio_exists,
+                    audio_size,
+                )
 
+            # ── Step 3: Transcribe ────────────────────────────────────────────
             logger.info(f"[{req.request_id}] Step 3: Transcribing audio")
             try:
                 transcript = await transcribe_audio(audio_file)
-                if audio_exists and not transcript:
+                if audio_file and os.path.exists(audio_file) and not transcript:
                     logger.warning(
                         "[%s] Whisper returned no segments despite audio file existing",
                         req.request_id,
@@ -507,24 +732,17 @@ async def analyze(req: AnalyzeRequest):
                 transcript = []
                 status = "partial"
 
-            # 3. Extract frames (1 frame every 5s for cost optimization)
-            logger.info(f"[{req.request_id}] Step 4: Extracting frames")
-            frames = await loop.run_in_executor(
-                None, extract_frames, video_file, work_dir, 5
-            )
-            first_frame = frames[0][1] if frames else ""
-            first_frame_exists = bool(first_frame and os.path.exists(first_frame))
-            first_frame_size = os.path.getsize(first_frame) if first_frame_exists else 0
-            logger.info(
-                "[%s] Step 5 prep | frames=%s | first_frame=%s | first_frame_exists=%s | first_frame_size_bytes=%s",
-                req.request_id,
-                len(frames),
-                first_frame or "<missing>",
-                first_frame_exists,
-                first_frame_size,
-            )
+            # ── Step 4: Extract frames ────────────────────────────────────────
+            frames: list[tuple[int, str]] = []
+            if video_file:
+                logger.info(f"[{req.request_id}] Step 4: Extracting frames")
+                frames = await loop.run_in_executor(
+                    None, extract_frames, video_file, work_dir, 5
+                )
+                debug_info.frame_count = len(frames)
+                logger.info("[%s] Frames extracted: %s", req.request_id, len(frames))
 
-            # 4. Analyze frames with GPT-4o Vision (concurrently)
+            # ── Step 5: Vision analysis ───────────────────────────────────────
             logger.info(f"[{req.request_id}] Step 5: Analyzing {len(frames)} frames with Vision")
             try:
                 visual_signals = await asyncio.gather(
@@ -536,7 +754,6 @@ async def analyze(req: AnalyzeRequest):
                 visual_signals = []
                 status = "partial"
 
-            # Sort by timestamp
             visual_signals.sort(key=lambda x: x.timestamp_seconds)
             unavailable_frames = sum(
                 1
@@ -553,23 +770,32 @@ async def analyze(req: AnalyzeRequest):
                 )
                 status = "partial"
 
-            # 5. Generate diagnostic
+            # ── Step 6: Generate diagnostic ───────────────────────────────────
             logger.info(f"[{req.request_id}] Step 6: Generating diagnostic")
             diagnostic = await generate_diagnostic(metadata, transcript, visual_signals)
             if diagnostic.global_summary == "Diagnostic generation encountered an error.":
                 status = "partial"
 
             processing_time = round(time.time() - start_time, 2)
-            logger.info(f"[{req.request_id}] Done in {processing_time}s, status={status}")
+            logger.info(
+                "[%s] Done in %ss | status=%s | analysis_type=%s | method=%s",
+                req.request_id,
+                processing_time,
+                status,
+                analysis_type,
+                debug_info.download_method,
+            )
 
             return AnalyzeResponse(
                 request_id=req.request_id,
                 status=status,
+                analysis_type=analysis_type,
                 metadata=metadata,
                 transcript=transcript,
                 visual_signals=visual_signals,
                 diagnostic=diagnostic,
                 processing_time_seconds=processing_time,
+                debug_info=debug_info,
             )
 
     except HTTPException:
@@ -580,15 +806,7 @@ async def analyze(req: AnalyzeRequest):
         logger.error(f"[{req.request_id}] Unexpected error: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"INTERNAL_ERROR: {exc}")
     finally:
-        # Always clean up temp files
         try:
             shutil.rmtree(work_dir, ignore_errors=True)
         except Exception:
             pass
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, workers=2, timeout_keep_alive=130)
