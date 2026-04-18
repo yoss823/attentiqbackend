@@ -9,15 +9,17 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 import yt_dlp
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
@@ -26,7 +28,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")
+RAPIDAPI_HOST = os.environ.get("RAPIDAPI_HOST", "tiktok-download-without-watermark.p.rapidapi.com")
 GLOBAL_TIMEOUT = 120  # seconds
+JOB_TTL_SECONDS = 3600  # jobs expire after 1 hour
 
 # User-Agent pool — rotated across retries to evade TikTok fingerprinting
 TIKTOK_USER_AGENTS = [
@@ -76,6 +81,10 @@ def openai_configured() -> bool:
     return bool(OPENAI_API_KEY.strip())
 
 
+def rapidapi_configured() -> bool:
+    return bool(RAPIDAPI_KEY.strip())
+
+
 def get_openai_client() -> AsyncOpenAI:
     global _openai_client
     if not openai_configured():
@@ -85,13 +94,97 @@ def get_openai_client() -> AsyncOpenAI:
     return _openai_client
 
 
+# ── In-memory Job Store ───────────────────────────────────────────────────────
+
+class JobStatus:
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class JobRecord(BaseModel):
+    job_id: str
+    status: str
+    result: Optional[Any] = None
+    error: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class JobStore:
+    """Thread-safe in-memory job store with TTL-based cleanup."""
+
+    def __init__(self) -> None:
+        self._store: dict[str, JobRecord] = {}
+        self._lock = threading.Lock()
+
+    def create(self, job_id: str) -> JobRecord:
+        now = datetime.now(timezone.utc)
+        record = JobRecord(
+            job_id=job_id,
+            status=JobStatus.PENDING,
+            created_at=now,
+            updated_at=now,
+        )
+        with self._lock:
+            self._store[job_id] = record
+        return record
+
+    def get(self, job_id: str) -> Optional[JobRecord]:
+        with self._lock:
+            return self._store.get(job_id)
+
+    def update_status(self, job_id: str, status: str) -> None:
+        with self._lock:
+            record = self._store.get(job_id)
+            if record:
+                record.status = status
+                record.updated_at = datetime.now(timezone.utc)
+
+    def complete(self, job_id: str, result: Any) -> None:
+        with self._lock:
+            record = self._store.get(job_id)
+            if record:
+                record.status = JobStatus.COMPLETED
+                record.result = result
+                record.updated_at = datetime.now(timezone.utc)
+
+    def fail(self, job_id: str, error: str) -> None:
+        with self._lock:
+            record = self._store.get(job_id)
+            if record:
+                record.status = JobStatus.FAILED
+                record.error = error
+                record.updated_at = datetime.now(timezone.utc)
+
+    def cleanup_expired(self) -> int:
+        """Remove jobs older than JOB_TTL_SECONDS. Returns count removed."""
+        cutoff = time.time() - JOB_TTL_SECONDS
+        removed = 0
+        with self._lock:
+            expired = [
+                jid
+                for jid, rec in self._store.items()
+                if rec.created_at.timestamp() < cutoff
+            ]
+            for jid in expired:
+                del self._store[jid]
+                removed += 1
+        return removed
+
+
+job_store = JobStore()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     key_prefix = OPENAI_API_KEY[:3] if OPENAI_API_KEY else "<missing>"
     logger.info(
-        "Attentiq backend starting up | openai_configured=%s | key_prefix=%s",
+        "Attentiq backend starting up | openai_configured=%s | key_prefix=%s | rapidapi_configured=%s",
         openai_configured(),
         key_prefix,
+        rapidapi_configured(),
     )
     yield
     logger.info("Attentiq backend shutting down")
@@ -157,12 +250,14 @@ class Metadata(BaseModel):
 
 
 class DebugInfo(BaseModel):
-    download_method: str  # "ytdlp" | "tiktok_mobile_api" | "failed"
+    download_method: str  # "rapidapi" | "ytdlp" | "tiktok_mobile_api" | "metadata_only" | "failed"
     video_size_bytes: int
     audio_size_bytes: int
     frame_count: int
     ytdlp_error: Optional[str] = None
     mobile_api_error: Optional[str] = None
+    rapidapi_error: Optional[str] = None
+    extraction_error: Optional[str] = None
 
 
 class AnalyzeResponse(BaseModel):
@@ -175,6 +270,21 @@ class AnalyzeResponse(BaseModel):
     diagnostic: Diagnostic
     processing_time_seconds: float
     debug_info: DebugInfo
+
+
+class JobSubmissionResponse(BaseModel):
+    job_id: str
+    status: str
+    created_at: datetime
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    result: Optional[AnalyzeResponse] = None
+    error: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
 
 
 # ── Health ───────────────────────────────────────────────────────────────────
@@ -198,6 +308,102 @@ def extract_tiktok_video_id(url: str) -> Optional[str]:
         if match:
             return match.group(1)
     return None
+
+
+# ── RapidAPI TikTok integration ───────────────────────────────────────────────
+
+async def fetch_tiktok_via_rapidapi(url: str) -> Optional[dict[str, Any]]:
+    """
+    Fetch TikTok video metadata and a direct download URL via RapidAPI.
+
+    Returns a dict with keys: video_url, title, author, duration, hashtags,
+    thumbnail — or None if the request fails or RAPIDAPI_KEY is not set.
+    Handles private/removed videos and rate-limit errors gracefully.
+    """
+    if not rapidapi_configured():
+        logger.info("RapidAPI not configured (RAPIDAPI_KEY missing) — skipping")
+        return None
+
+    headers = {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": RAPIDAPI_HOST,
+    }
+    params = {"url": url, "hd": "1"}
+    endpoint = f"https://{RAPIDAPI_HOST}/analysis"
+
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            logger.info("RapidAPI TikTok request | endpoint=%s | url=%s", endpoint, url)
+            resp = await client.get(endpoint, headers=headers, params=params)
+
+            if resp.status_code == 429:
+                logger.warning("RapidAPI rate limit hit (HTTP 429)")
+                return None
+            if resp.status_code == 403:
+                logger.warning("RapidAPI forbidden (HTTP 403) — check RAPIDAPI_KEY")
+                return None
+            if resp.status_code != 200:
+                logger.warning("RapidAPI returned HTTP %s: %s", resp.status_code, resp.text[:200])
+                return None
+
+            data = resp.json()
+
+            # Surface private/removed video errors
+            if data.get("code") not in (0, None) or data.get("msg") in ("error", "failed"):
+                logger.warning("RapidAPI error response: %s", data.get("msg") or data)
+                return None
+
+            # Navigate the response structure
+            video_data = data.get("data") or data
+
+            # Extract direct video URL — prefer HD, fall back to SD
+            video_url = (
+                video_data.get("hdplay")
+                or video_data.get("play")
+                or video_data.get("wmplay")
+                or ""
+            )
+            if not video_url:
+                logger.warning("RapidAPI response contained no playable video URL")
+                return None
+
+            # Extract hashtags from title/description
+            title = str(video_data.get("title") or "")
+            hashtags: list[str] = []
+            for word in title.split():
+                if word.startswith("#"):
+                    hashtags.append(word)
+            # Also check dedicated music/tag fields if present
+            for tag in (video_data.get("tags") or []):
+                tag_str = str(tag) if not isinstance(tag, str) else tag
+                entry = tag_str if tag_str.startswith("#") else f"#{tag_str}"
+                if entry not in hashtags:
+                    hashtags.append(entry)
+            hashtags = hashtags[:10]
+
+            result = {
+                "video_url": video_url,
+                "title": title,
+                "author": str(
+                    video_data.get("author")
+                    or (video_data.get("music_info") or {}).get("author")
+                    or "unknown"
+                ),
+                "duration": int(video_data.get("duration") or 0),
+                "hashtags": hashtags,
+                "thumbnail": str(video_data.get("cover") or video_data.get("origin_cover") or ""),
+            }
+            logger.info(
+                "RapidAPI extraction succeeded | author=%s | duration=%ss | has_video_url=%s",
+                result["author"],
+                result["duration"],
+                bool(result["video_url"]),
+            )
+            return result
+
+    except Exception as exc:
+        logger.warning("RapidAPI request failed (%s): %s", type(exc).__name__, exc)
+        return None
 
 
 # ── Mobile TikTok API fallback ───────────────────────────────────────────────
@@ -765,10 +971,13 @@ Respond with ONLY valid JSON (no markdown, no code block) with this exact struct
         )
 
 
-# ── Main endpoint ─────────────────────────────────────────────────────────────
+# ── Background pipeline task ──────────────────────────────────────────────────
 
-@app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(req: AnalyzeRequest):
+async def _run_analysis_pipeline(job_id: str, req: AnalyzeRequest) -> None:
+    """
+    Full analysis pipeline executed as a background task.
+    Updates job_store on completion or failure.
+    """
     start_time = time.time()
     work_dir = tempfile.mkdtemp(prefix="attentiq_")
     status = "success"
@@ -780,44 +989,95 @@ async def analyze(req: AnalyzeRequest):
         frame_count=0,
     )
 
+    logger.info("[%s] job=%s | Starting analysis of %s", req.request_id, job_id, req.url)
+    job_store.update_status(job_id, JobStatus.PROCESSING)
+
     try:
         async with asyncio.timeout(GLOBAL_TIMEOUT):
-            logger.info(f"[{req.request_id}] Starting analysis of {req.url}")
-
-            # ── Step 1: Download video (yt-dlp with enhanced TikTok headers) ───
-            logger.info(f"[{req.request_id}] Step 1: Extracting video via yt-dlp")
             loop = asyncio.get_event_loop()
             video_file: Optional[str] = None
             video_info: Optional[dict] = None
-            ytdlp_error: Optional[str] = None
 
-            try:
-                video_info = await loop.run_in_executor(
-                    None, extract_video, req.url, work_dir, req.max_duration_seconds
-                )
-                video_file = video_info["video_file"]
-                video_size = os.path.getsize(video_file) if video_file and os.path.exists(video_file) else 0
-                logger.info(
-                    "[%s] yt-dlp download complete | size_bytes=%s",
-                    req.request_id,
-                    video_size,
-                )
-                debug_info.download_method = "ytdlp"
-                debug_info.video_size_bytes = video_size
-            except HTTPException as exc:
-                # Re-raise 404/400 immediately (video unavailable or too long)
-                if exc.status_code in (404, 400):
+            is_tiktok = "tiktok" in req.url.lower()
+
+            # ── Step 1a: RapidAPI (primary for TikTok) ────────────────────────
+            rapidapi_error: Optional[str] = None
+            if is_tiktok:
+                logger.info("[%s] job=%s | Step 1a: Trying RapidAPI TikTok extraction", req.request_id, job_id)
+                try:
+                    rapidapi_data = await fetch_tiktok_via_rapidapi(req.url)
+                    if rapidapi_data:
+                        # Enforce duration limit
+                        duration = rapidapi_data["duration"]
+                        if duration > req.max_duration_seconds:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"DURATION_EXCEEDED: video is {duration}s, limit is {req.max_duration_seconds}s",
+                            )
+                        # Download the video file
+                        downloaded = await download_from_url(
+                            rapidapi_data["video_url"], work_dir, req.request_id
+                        )
+                        if downloaded:
+                            video_file = downloaded
+                            video_size = os.path.getsize(video_file)
+                            debug_info.download_method = "rapidapi"
+                            debug_info.video_size_bytes = video_size
+                            video_info = {
+                                "video_file": video_file,
+                                "duration": duration,
+                                "author": rapidapi_data["author"],
+                                "title": rapidapi_data["title"],
+                                "hashtags": rapidapi_data["hashtags"],
+                            }
+                            logger.info(
+                                "[%s] job=%s | RapidAPI download complete | size_bytes=%s | method=rapidapi",
+                                req.request_id, job_id, video_size,
+                            )
+                        else:
+                            rapidapi_error = "RapidAPI returned a URL but download failed"
+                            logger.warning("[%s] job=%s | %s", req.request_id, job_id, rapidapi_error)
+                    else:
+                        rapidapi_error = "RapidAPI returned no data"
+                        logger.warning("[%s] job=%s | %s", req.request_id, job_id, rapidapi_error)
+                except HTTPException:
                     raise
-                ytdlp_error = str(exc.detail)
-                logger.warning("[%s] yt-dlp failed: %s", req.request_id, ytdlp_error)
-            except Exception as exc:
-                ytdlp_error = str(exc)
-                logger.warning("[%s] yt-dlp failed: %s", req.request_id, ytdlp_error)
-                debug_info.ytdlp_error = ytdlp_error
+                except Exception as exc:
+                    rapidapi_error = str(exc)
+                    logger.warning("[%s] job=%s | RapidAPI failed: %s", req.request_id, job_id, exc)
 
-            # ── Step 1b: Mobile TikTok API fallback ──────────────────────────
-            if not video_file and "tiktok" in req.url.lower():
-                logger.info("[%s] Trying mobile TikTok API fallback", req.request_id)
+                if rapidapi_error:
+                    debug_info.rapidapi_error = rapidapi_error
+
+            # ── Step 1b: yt-dlp fallback ──────────────────────────────────────
+            ytdlp_error: Optional[str] = None
+            if not video_file:
+                logger.info("[%s] job=%s | Step 1b: Trying yt-dlp extraction", req.request_id, job_id)
+                try:
+                    video_info = await loop.run_in_executor(
+                        None, extract_video, req.url, work_dir, req.max_duration_seconds
+                    )
+                    video_file = video_info["video_file"]
+                    video_size = os.path.getsize(video_file) if video_file and os.path.exists(video_file) else 0
+                    debug_info.download_method = "ytdlp"
+                    debug_info.video_size_bytes = video_size
+                    logger.info(
+                        "[%s] job=%s | yt-dlp download complete | size_bytes=%s | method=ytdlp",
+                        req.request_id, job_id, video_size,
+                    )
+                except HTTPException as exc:
+                    if exc.status_code in (404, 400):
+                        raise
+                    ytdlp_error = str(exc.detail)
+                    logger.warning("[%s] job=%s | yt-dlp failed: %s", req.request_id, job_id, ytdlp_error)
+                except Exception as exc:
+                    ytdlp_error = str(exc)
+                    logger.warning("[%s] job=%s | yt-dlp failed: %s", req.request_id, job_id, ytdlp_error)
+                    debug_info.ytdlp_error = ytdlp_error
+
+            # ── Step 1c: Mobile TikTok API fallback ───────────────────────────
+            if not video_file and is_tiktok:
+                logger.info("[%s] job=%s | Step 1c: Trying mobile TikTok API fallback", req.request_id, job_id)
                 video_id = extract_tiktok_video_id(req.url)
                 mobile_error: Optional[str] = None
 
@@ -831,38 +1091,37 @@ async def analyze(req: AnalyzeRequest):
                                 debug_info.download_method = "tiktok_mobile_api"
                                 debug_info.video_size_bytes = video_size
                                 logger.info(
-                                    "[%s] Mobile API fallback succeeded | size_bytes=%s",
-                                    req.request_id,
-                                    video_size,
+                                    "[%s] job=%s | Mobile API fallback succeeded | size_bytes=%s | method=tiktok_mobile_api",
+                                    req.request_id, job_id, video_size,
                                 )
                         else:
                             mobile_error = "Mobile API returned no video URL"
                     except Exception as exc:
                         mobile_error = str(exc)
-                        logger.warning("[%s] Mobile API fallback failed: %s", req.request_id, exc)
+                        logger.warning("[%s] job=%s | Mobile API fallback failed: %s", req.request_id, job_id, exc)
                 else:
                     mobile_error = "Could not extract video_id from URL"
 
                 if mobile_error:
                     debug_info.mobile_api_error = mobile_error
 
-            # ── Step 1c: Metadata-only fallback (last resort) ────────────────
+            # ── Step 1d: Metadata-only fallback (last resort) ─────────────────
             if not video_info:
-                logger.info("[%s] Falling back to metadata-only extraction", req.request_id)
+                logger.info("[%s] job=%s | Step 1d: Falling back to metadata-only extraction", req.request_id, job_id)
                 try:
                     video_info = await loop.run_in_executor(
                         None, extract_metadata_only, req.url, req.max_duration_seconds
                     )
-                    # Surface extraction_error in debug_info when all methods failed
                     extraction_error = video_info.get("extraction_error")
                     if extraction_error:
                         logger.error(
-                            "[%s] All extraction methods failed: %s",
-                            req.request_id,
-                            extraction_error,
+                            "[%s] job=%s | All extraction methods failed: %s",
+                            req.request_id, job_id, extraction_error,
                         )
+                        debug_info.extraction_error = extraction_error
                         if not debug_info.ytdlp_error:
                             debug_info.ytdlp_error = extraction_error
+                    debug_info.download_method = "metadata_only"
                 except HTTPException:
                     raise
                 except Exception as exc:
@@ -871,7 +1130,7 @@ async def analyze(req: AnalyzeRequest):
             if not video_file:
                 analysis_type = "metadata_only"
                 status = "partial"
-                logger.warning("[%s] No video file — metadata_only mode", req.request_id)
+                logger.warning("[%s] job=%s | No video file — metadata_only mode", req.request_id, job_id)
 
             metadata = Metadata(
                 url=req.url,
@@ -885,7 +1144,7 @@ async def analyze(req: AnalyzeRequest):
             # ── Step 2: Extract audio ─────────────────────────────────────────
             audio_file = ""
             if video_file:
-                logger.info(f"[{req.request_id}] Step 2: Extracting audio")
+                logger.info("[%s] job=%s | Step 2: Extracting audio", req.request_id, job_id)
                 audio_file = await loop.run_in_executor(
                     None, extract_audio, video_file, work_dir
                 )
@@ -893,46 +1152,47 @@ async def analyze(req: AnalyzeRequest):
                 audio_size = os.path.getsize(audio_file) if audio_exists else 0
                 debug_info.audio_size_bytes = audio_size
                 logger.info(
-                    "[%s] Audio | exists=%s | size_bytes=%s",
-                    req.request_id,
-                    audio_exists,
-                    audio_size,
+                    "[%s] job=%s | Audio | exists=%s | size_bytes=%s",
+                    req.request_id, job_id, audio_exists, audio_size,
                 )
 
             # ── Step 3: Transcribe ────────────────────────────────────────────
-            logger.info(f"[{req.request_id}] Step 3: Transcribing audio")
+            logger.info("[%s] job=%s | Step 3: Transcribing audio", req.request_id, job_id)
             try:
                 transcript = await transcribe_audio(audio_file)
                 if audio_file and os.path.exists(audio_file) and not transcript:
                     logger.warning(
-                        "[%s] Whisper returned no segments despite audio file existing",
-                        req.request_id,
+                        "[%s] job=%s | Whisper returned no segments despite audio file existing",
+                        req.request_id, job_id,
                     )
                     status = "partial"
             except Exception as exc:
-                logger.warning(f"[{req.request_id}] Transcript failed: {exc}")
+                logger.warning("[%s] job=%s | Transcript failed: %s", req.request_id, job_id, exc)
                 transcript = []
                 status = "partial"
 
             # ── Step 4: Extract frames ────────────────────────────────────────
             frames: list[tuple[int, str]] = []
             if video_file:
-                logger.info(f"[{req.request_id}] Step 4: Extracting frames")
+                logger.info("[%s] job=%s | Step 4: Extracting frames", req.request_id, job_id)
                 frames = await loop.run_in_executor(
                     None, extract_frames, video_file, work_dir, 5
                 )
                 debug_info.frame_count = len(frames)
-                logger.info("[%s] Frames extracted: %s", req.request_id, len(frames))
+                logger.info("[%s] job=%s | Frames extracted: %s", req.request_id, job_id, len(frames))
 
             # ── Step 5: Vision analysis ───────────────────────────────────────
-            logger.info(f"[{req.request_id}] Step 5: Analyzing {len(frames)} frames with Vision")
+            logger.info(
+                "[%s] job=%s | Step 5: Analyzing %s frames with Vision",
+                req.request_id, job_id, len(frames),
+            )
             try:
                 visual_signals = await asyncio.gather(
                     *[analyze_frame(ts, path) for ts, path in frames]
                 )
                 visual_signals = list(visual_signals)
             except Exception as exc:
-                logger.warning(f"[{req.request_id}] Vision failed: {exc}")
+                logger.warning("[%s] job=%s | Vision failed: %s", req.request_id, job_id, exc)
                 visual_signals = []
                 status = "partial"
 
@@ -945,30 +1205,25 @@ async def analyze(req: AnalyzeRequest):
             )
             if unavailable_frames:
                 logger.warning(
-                    "[%s] Vision unavailable on %s/%s frames",
-                    req.request_id,
-                    unavailable_frames,
-                    len(visual_signals),
+                    "[%s] job=%s | Vision unavailable on %s/%s frames",
+                    req.request_id, job_id, unavailable_frames, len(visual_signals),
                 )
                 status = "partial"
 
             # ── Step 6: Generate diagnostic ───────────────────────────────────
-            logger.info(f"[{req.request_id}] Step 6: Generating diagnostic")
+            logger.info("[%s] job=%s | Step 6: Generating diagnostic", req.request_id, job_id)
             diagnostic = await generate_diagnostic(metadata, transcript, visual_signals)
             if diagnostic.global_summary == "Diagnostic generation encountered an error.":
                 status = "partial"
 
             processing_time = round(time.time() - start_time, 2)
             logger.info(
-                "[%s] Done in %ss | status=%s | analysis_type=%s | method=%s",
-                req.request_id,
-                processing_time,
-                status,
-                analysis_type,
+                "[%s] job=%s | Completed in %ss | status=%s | analysis_type=%s | method=%s",
+                req.request_id, job_id, processing_time, status, analysis_type,
                 debug_info.download_method,
             )
 
-            return AnalyzeResponse(
+            result = AnalyzeResponse(
                 request_id=req.request_id,
                 status=status,
                 analysis_type=analysis_type,
@@ -979,16 +1234,78 @@ async def analyze(req: AnalyzeRequest):
                 processing_time_seconds=processing_time,
                 debug_info=debug_info,
             )
+            job_store.complete(job_id, result.model_dump())
 
-    except HTTPException:
-        raise
+    except HTTPException as exc:
+        error_msg = f"HTTP {exc.status_code}: {exc.detail}"
+        logger.error("[%s] job=%s | Pipeline HTTP error: %s", req.request_id, job_id, error_msg)
+        job_store.fail(job_id, error_msg)
     except TimeoutError:
-        raise HTTPException(status_code=504, detail="TIMEOUT: pipeline exceeded 120s")
+        error_msg = "TIMEOUT: pipeline exceeded 120s"
+        logger.error("[%s] job=%s | %s", req.request_id, job_id, error_msg)
+        job_store.fail(job_id, error_msg)
     except Exception as exc:
-        logger.error(f"[{req.request_id}] Unexpected error: {exc}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"INTERNAL_ERROR: {exc}")
+        error_msg = f"INTERNAL_ERROR: {exc}"
+        logger.error("[%s] job=%s | Unexpected error: %s", req.request_id, job_id, exc, exc_info=True)
+        job_store.fail(job_id, error_msg)
     finally:
         try:
             shutil.rmtree(work_dir, ignore_errors=True)
         except Exception:
             pass
+        # Opportunistic cleanup of expired jobs
+        removed = job_store.cleanup_expired()
+        if removed:
+            logger.info("job=%s | Cleaned up %s expired job(s)", job_id, removed)
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.post("/analyze", response_model=JobSubmissionResponse, status_code=202)
+async def analyze(req: AnalyzeRequest, background_tasks: BackgroundTasks):
+    """
+    Submit a video analysis job. Returns immediately with a job_id.
+    Poll GET /analyze/{job_id} to retrieve the result.
+    """
+    job_id = str(uuid.uuid4())
+    record = job_store.create(job_id)
+    background_tasks.add_task(_run_analysis_pipeline, job_id, req)
+    logger.info(
+        "[%s] job=%s | Job created for url=%s",
+        req.request_id, job_id, req.url,
+    )
+    return JobSubmissionResponse(
+        job_id=job_id,
+        status=record.status,
+        created_at=record.created_at,
+    )
+
+
+@app.get("/analyze/{job_id}", response_model=JobStatusResponse)
+async def get_job_status(job_id: str):
+    """
+    Poll the status of a previously submitted analysis job.
+
+    Returns the full AnalyzeResponse in `result` when status == "completed".
+    Returns an error message in `error` when status == "failed".
+    Returns 404 if the job_id is unknown or has expired.
+    """
+    record = job_store.get(job_id)
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Job '{job_id}' not found or has expired",
+        )
+
+    result_payload: Optional[AnalyzeResponse] = None
+    if record.status == JobStatus.COMPLETED and record.result is not None:
+        result_payload = AnalyzeResponse(**record.result)
+
+    return JobStatusResponse(
+        job_id=record.job_id,
+        status=record.status,
+        result=result_payload,
+        error=record.error,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
