@@ -518,22 +518,32 @@ async def debug_ai():
     results = {}
 
     # Test Groq
-    try:
-        test_groq = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-        results["groq"] = {"status": "ok", "key_present": bool(os.environ.get("GROQ_API_KEY"))}
-    except Exception as e:
-        results["groq"] = {"status": "error", "message": str(e)}
+    groq_key = os.environ.get("GROQ_API_KEY")
+    if not groq_key:
+        results["groq"] = {"status": "error", "key_present": False, "message": "GROQ_API_KEY not set in Railway Variables"}
+    else:
+        try:
+            test_groq = Groq(api_key=groq_key)
+            # Verify the key works by listing models (cheap/fast)
+            test_groq.models.list()
+            results["groq"] = {"status": "ok", "key_present": True}
+        except Exception as e:
+            results["groq"] = {"status": "error", "key_present": True, "message": str(e)}
 
     # Test Anthropic
-    try:
-        test_claude = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-        response = test_claude.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=10,
-            messages=[{"role": "user", "content": "ping"}]
-        )
-        results["anthropic"] = {"status": "ok", "response": response.content[0].text}
-    except Exception as e:
-        results["anthropic"] = {"status": "error", "message": str(e)}
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not anthropic_key:
+        results["anthropic"] = {"status": "error", "key_present": False, "message": "ANTHROPIC_API_KEY not set in Railway Variables"}
+    else:
+        try:
+            test_claude = anthropic.Anthropic(api_key=anthropic_key)
+            response = test_claude.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=10,
+                messages=[{"role": "user", "content": "ping"}]
+            )
+            results["anthropic"] = {"status": "ok", "key_present": True, "response": response.content[0].text}
+        except Exception as e:
+            results["anthropic"] = {"status": "error", "key_present": True, "message": str(e)}
 
     return results
