@@ -1,7 +1,8 @@
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
-openai==1.57.0
-yt-dlp==2025.6.9
+groq>=0.9.0
+anthropic>=0.34.0
+yt-dlp==2024.12.23
 httpx==0.28.1
 pydantic==2.10.3
 python-multipart==0.0.20
