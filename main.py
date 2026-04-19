@@ -1,16 +1,23 @@
-import os, uuid, asyncio, tempfile, subprocess, base64, time, json, requests
+import os
+import uuid
+import asyncio
+import subprocess
+import base64
+import requests
+import json
+
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-import httpx
+from urllib.parse import urlparse, urlunparse
 from groq import Groq
 
-# ─── Clients ──────────────────────────────────────────────────────────────────
+# ─── Clients ────────────────────────────────────────────────────────────────
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")
 
-# ─── App ──────────────────────────────────────────────────────────────────────
+# ─── App ─────────────────────────────────────────────────────────────────────
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -19,10 +26,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Job store (in-memory) ────────────────────────────────────────────────────
 jobs: dict = {}
 
-# ─── Models ───────────────────────────────────────────────────────────────────
+# ─── Modèles Pydantic ────────────────────────────────────────────────────────
 class AnalyzeRequest(BaseModel):
     request_id: Optional[str] = None
     url: str
@@ -30,12 +36,14 @@ class AnalyzeRequest(BaseModel):
     max_duration_seconds: Optional[int] = 60
     requested_at: Optional[str] = None
 
-# ─── Health ───────────────────────────────────────────────────────────────────
+
+# ─── Health ──────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# ─── Debug AI (Groq only) ─────────────────────────────────────────────────────
+
+# ─── Debug AI (Groq only) ────────────────────────────────────────────────────
 @app.get("/debug/ai")
 async def debug_ai():
     results = {}
@@ -54,191 +62,249 @@ async def debug_ai():
         results["groq"] = {"status": "error", "message": str(e)}
     return results
 
-# ─── Debug RapidAPI ───────────────────────────────────────────────────────────
+
+# ─── Debug RapidAPI ──────────────────────────────────────────────────────────
 @app.get("/debug/rapidapi")
 async def debug_rapidapi(url: str):
-    headers = {
-        "x-rapidapi-host": "tiktok-download-video-no-watermark.p.rapidapi.com",
-        "x-rapidapi-key": RAPIDAPI_KEY,
-    }
-    params = {"url": url, "hd": "1"}
-    with httpx.Client(timeout=30) as client:
-        response = client.get(
-            "https://tiktok-download-video-no-watermark.p.rapidapi.com/tiktok/info",
-            headers=headers,
-            params=params,
-        )
-    return response.json()
+    try:
+        data = _call_rapidapi(url)
+        d = data.get("data", {})
+        return {
+            "raw_response": data,
+            "has_data": bool(d),
+            "has_video_link_nwm": bool(d.get("video_link_nwm")),
+            "has_play": bool(d.get("play")),
+            "has_music": bool(d.get("music")),
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
-# ─── Download via RapidAPI ────────────────────────────────────────────────────
-MOBILE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    "Referer": "https://www.tiktok.com/",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-}
+
+# ─── Utilitaires ─────────────────────────────────────────────────────────────
+def _clean_tiktok_url(url: str) -> str:
+    """Supprime les query params d'une URL TikTok."""
+    parsed = urlparse(url)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+
+def _call_rapidapi(tiktok_url: str) -> dict:
+    """
+    Appelle RapidAPI tiktok-download-without-watermark.
+    Gère les deux formats de réponse :
+      - Format A : {"code": 0, "data": {...}}
+      - Format B : {"link": "...", "data": {...}}  (pas de champ "code")
+    """
+    api_url = "https://tiktok-download-without-watermark.p.rapidapi.com/analysis"
+    headers = {
+        "X-RapidAPI-Key": RAPIDAPI_KEY,
+        "X-RapidAPI-Host": "tiktok-download-without-watermark.p.rapidapi.com",
+    }
+    params = {"url": tiktok_url, "hd": "0"}
+
+    response = requests.get(api_url, headers=headers, params=params, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+
+    # Vérifier le code SEULEMENT s'il est explicitement présent et non nul
+    code = data.get("code")
+    if code is not None and code != 0:
+        # Retry avec URL nettoyée
+        clean_url = _clean_tiktok_url(tiktok_url)
+        if clean_url != tiktok_url:
+            params["url"] = clean_url
+            r2 = requests.get(api_url, headers=headers, params=params, timeout=30)
+            r2.raise_for_status()
+            data2 = r2.json()
+            code2 = data2.get("code")
+            if code2 is None or code2 == 0:
+                return data2
+        raise ValueError(f"RapidAPI error code {code}: {data.get('msg', 'unknown error')}")
+
+    return data
+
 
 def download_tiktok_via_rapidapi(tiktok_url: str) -> tuple:
     """
-    Returns (local_path, mode) where mode is "video" or "audio_only".
+    Télécharge la vidéo TikTok via RapidAPI.
+    Retourne (local_path, mode) où mode est "video" ou "audio_only".
     """
-    headers_api = {
-        "x-rapidapi-host": "tiktok-download-video-no-watermark.p.rapidapi.com",
-        "x-rapidapi-key": RAPIDAPI_KEY,
-    }
-    params = {"url": tiktok_url, "hd": "1"}
+    data = _call_rapidapi(tiktok_url)
+    data_obj = data.get("data", {})
 
-    with httpx.Client(timeout=30) as client:
-        response = client.get(
-            "https://tiktok-download-video-no-watermark.p.rapidapi.com/tiktok/info",
-            headers=headers_api,
-            params=params,
+    if not data_obj:
+        data_obj = data  # Format B sans nesting
+
+    # Ordre de priorité pour la vidéo
+    video_url = (
+        data_obj.get("play")
+        or data_obj.get("video_link_nwm")
+        or data_obj.get("nwm_video_url_HQ")
+        or data_obj.get("hdplay")
+        or data_obj.get("wmplay")
+    )
+    audio_url = data_obj.get("music") or data_obj.get("audio")
+
+    if not video_url and not audio_url:
+        raise ValueError(
+            f"Impossible d'extraire une URL téléchargeable depuis RapidAPI. Réponse: {data}"
         )
-    data = response.json()
-    if data.get("code") != 0:
-        raise ValueError(f"RapidAPI error: {data}")
 
-    d = data.get("data", {})
-    video_candidates = [
-        u for u in [d.get("play"), d.get("hdplay"), d.get("video_link_nwm"), d.get("wmplay")] if u
-    ]
-    audio_url = d.get("music") or d.get("audio")
+    # Headers mobiles pour contourner le blocage CDN TikTok
+    download_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        ),
+        "Referer": "https://www.tiktok.com/",
+        "Accept": "*/*",
+    }
 
-    # Try each video URL
-    for video_url in video_candidates:
+    last_error = None
+
+    # Essai vidéo
+    if video_url:
         try:
             local_path = f"/tmp/{uuid.uuid4()}.mp4"
-            with httpx.Client(timeout=60, follow_redirects=True, headers=MOBILE_HEADERS) as client:
-                r = client.get(video_url)
-                r.raise_for_status()
+            r = requests.get(
+                video_url, headers=download_headers, stream=True, timeout=60
+            )
+            r.raise_for_status()
             with open(local_path, "wb") as f:
-                f.write(r.content)
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
             file_size = os.path.getsize(local_path)
             if file_size > 50000:
-                print(f"[OK] Video downloaded ({file_size} bytes)")
+                print(f"[OK] Vidéo téléchargée ({file_size} bytes)")
                 return local_path, "video"
             else:
                 os.remove(local_path)
-                print(f"[SKIP] File too small ({file_size} bytes)")
+                last_error = f"Fichier trop petit: {file_size} bytes"
         except Exception as e:
-            print(f"[FAIL] Video URL failed: {e}")
-            continue
+            last_error = str(e)
 
-    # Fallback: audio only
+    # Fallback audio
     if audio_url:
         try:
             local_path = f"/tmp/{uuid.uuid4()}.mp3"
-            with httpx.Client(timeout=60, follow_redirects=True, headers=MOBILE_HEADERS) as client:
-                r = client.get(audio_url)
-                r.raise_for_status()
+            r = requests.get(
+                audio_url, headers=download_headers, stream=True, timeout=60
+            )
+            r.raise_for_status()
             with open(local_path, "wb") as f:
-                f.write(r.content)
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
             file_size = os.path.getsize(local_path)
             if file_size > 10000:
-                print(f"[OK] Audio-only downloaded ({file_size} bytes)")
+                print(f"[OK] Audio seul téléchargé ({file_size} bytes)")
                 return local_path, "audio_only"
         except Exception as e:
-            print(f"[FAIL] Audio URL failed: {e}")
+            last_error = str(e)
 
-    raise ValueError(f"Unable to download video or audio from RapidAPI. Tried URLs: {video_candidates}")
+    raise ValueError(
+        f"Impossible de télécharger la vidéo ou l'audio. Dernière erreur: {last_error}"
+    )
 
-# ─── Transcription (Groq Whisper) ─────────────────────────────────────────────
+
+# ─── Transcription (Groq Whisper) ────────────────────────────────────────────
 def transcribe_audio(file_path: str) -> list:
-    """Works with both .mp4 and .mp3 files."""
-    # If mp4, extract audio first
-    if file_path.endswith(".mp4"):
-        audio_path = file_path.replace(".mp4", "_audio.mp3")
-        subprocess.run(
-            ["ffmpeg", "-i", file_path, "-q:a", "0", "-map", "a", audio_path, "-y"],
-            capture_output=True,
-            check=True,
-        )
-    else:
-        audio_path = file_path
-
-    with open(audio_path, "rb") as f:
+    """Transcrit un fichier audio/vidéo via Groq Whisper."""
+    with open(file_path, "rb") as f:
         transcript = groq_client.audio.transcriptions.create(
             model="whisper-large-v3",
             file=f,
             response_format="verbose_json",
-            timestamp_granularities=["segment"],
         )
-
-    if audio_path != file_path and os.path.exists(audio_path):
-        os.remove(audio_path)
-
     segments = []
     if hasattr(transcript, "segments") and transcript.segments:
         for seg in transcript.segments:
-            segments.append({"start": seg.start, "end": seg.end, "text": seg.text})
+            segments.append(
+                {"start": seg.get("start", 0), "end": seg.get("end", 0), "text": seg.get("text", "")}
+            )
+    elif hasattr(transcript, "text") and transcript.text:
+        # Pas de segments détaillés — on met tout dans un seul segment
+        segments.append({"start": 0.0, "end": 0.0, "text": transcript.text})
     return segments
 
-# ─── Visual Analysis (Groq Vision) ───────────────────────────────────────────
+
+# ─── Analyse visuelle (Groq Vision — llama-4-scout) ──────────────────────────
 def analyze_frames(mp4_path: str) -> list:
+    """Extrait des frames via ffmpeg et les analyse via Groq Vision."""
     frames_dir = f"/tmp/frames_{uuid.uuid4()}"
     os.makedirs(frames_dir, exist_ok=True)
 
-    subprocess.run(
-        ["ffmpeg", "-i", mp4_path, "-vf", "fps=1/5", f"{frames_dir}/frame_%04d.jpg", "-y"],
-        capture_output=True,
-        check=True,
-    )
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-i", mp4_path,
+                "-vf", "fps=1/5",
+                f"{frames_dir}/frame_%04d.jpg",
+                "-y",
+            ],
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"[WARN] ffmpeg error: {e.stderr.decode()}")
+        return []
 
     frames = sorted([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
     visual_signals = []
 
     for i, frame_file in enumerate(frames[:12]):
         frame_path = os.path.join(frames_dir, frame_file)
-        with open(frame_path, "rb") as f:
-            img_b64 = base64.b64encode(f.read()).decode()
+        try:
+            with open(frame_path, "rb") as f:
+                img_b64 = base64.b64encode(f.read()).decode()
 
-        # Try llama-4-scout first, fallback to llama-3.2-90b-vision-preview
-        for model in ["meta-llama/llama-4-scout-17b-16e-instruct", "llama-3.2-90b-vision-preview"]:
-            try:
-                response = groq_client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+            response = groq_client.chat.completions.create(
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{img_b64}"
                                 },
-                                {
-                                    "type": "text",
-                                    "text": "Analyse cette frame de vidéo TikTok. Réponds en JSON avec les champs: face_expression (str), body_position (str), on_screen_text (str), motion_level (low|medium|high), scene_change (bool), energy_level (low|medium|high)",
-                                },
-                            ],
-                        }
-                    ],
-                    max_tokens=300,
-                )
-                content = response.choices[0].message.content
-                # Clean markdown if present
-                content = content.strip()
-                if content.startswith("```"):
-                    content = content.split("```")[1]
-                    if content.startswith("json"):
-                        content = content[4:]
-                signal = json.loads(content.strip())
-                break
-            except Exception as e:
-                if model == "llama-3.2-90b-vision-preview":
-                    signal = {
-                        "face_expression": "unknown",
-                        "body_position": "unknown",
-                        "on_screen_text": "",
-                        "motion_level": "medium",
-                        "scene_change": False,
-                        "energy_level": "medium",
+                            },
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Analyse cette frame de vidéo TikTok. "
+                                    "Réponds UNIQUEMENT en JSON valide avec ces champs : "
+                                    "face_expression (str), body_position (str), "
+                                    "on_screen_text (str), motion_level (low|medium|high), "
+                                    "scene_change (bool)."
+                                ),
+                            },
+                        ],
                     }
-                continue
+                ],
+                max_tokens=300,
+            )
+            content = response.choices[0].message.content.strip()
+            # Nettoyer les balises markdown si présentes
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+            signal = json.loads(content.strip())
+        except Exception as e:
+            print(f"[WARN] Frame analysis error: {e}")
+            signal = {
+                "face_expression": "unknown",
+                "body_position": "unknown",
+                "on_screen_text": "",
+                "motion_level": "medium",
+                "scene_change": False,
+            }
+        finally:
+            if os.path.exists(frame_path):
+                os.remove(frame_path)
 
         signal["timestamp_seconds"] = i * 5
         visual_signals.append(signal)
-        os.remove(frame_path)
 
     try:
         os.rmdir(frames_dir)
@@ -247,8 +313,10 @@ def analyze_frames(mp4_path: str) -> list:
 
     return visual_signals
 
-# ─── Diagnostic Generation (Groq LLM) ────────────────────────────────────────
+
+# ─── Génération du diagnostic (Groq LLM — llama-3.3-70b) ─────────────────────
 def generate_diagnostic(transcript: list, visual_signals: list, url: str = "") -> dict:
+    """Génère le diagnostic de rétention via Groq LLM."""
     transcript_text = (
         " | ".join([f"[{s['start']:.1f}s] {s['text']}" for s in transcript])
         if transcript
@@ -257,13 +325,12 @@ def generate_diagnostic(transcript: list, visual_signals: list, url: str = "") -
     visual_text = (
         json.dumps(visual_signals[:6], ensure_ascii=False)
         if visual_signals
-        else "Analyse visuelle non disponible (mode audio uniquement)"
+        else "Aucun signal visuel (mode audio uniquement)"
     )
 
     prompt = f"""Tu es un expert en rétention d'audience pour les vidéos courtes (TikTok, Reels, Shorts).
-À partir de la transcription et des signaux visuels fournis, produis un diagnostic JSON structuré.
-Sois direct, précis, sans jargon. Chaque insight doit être actionnable.
-Réponds UNIQUEMENT avec du JSON valide, sans markdown, sans texte avant ou après.
+
+Analyse cette vidéo TikTok et génère un diagnostic structurel de rétention.
 
 TRANSCRIPT (avec timestamps):
 {transcript_text}
@@ -273,81 +340,77 @@ SIGNAUX VISUELS (frames):
 
 URL: {url}
 
-Structure JSON attendue (EXACTE, ne rien ajouter ni retirer):
+Génère un JSON avec EXACTEMENT cette structure (rien d'autre, pas de markdown) :
 {{
   "retention_score": <float 1-10>,
   "global_summary": "<2-3 phrases sur la qualité de rétention globale>",
   "drop_off_rule": "<règle principale de décrochage observée>",
   "creator_perception": "<comment le spectateur perçoit le créateur>",
   "attention_drops": [
-    {{"timestamp_seconds": <int>, "severity": "high|medium|low", "cause": "<explication précise>"}}
+    {{"timestamp_seconds": <int>, "severity": "high|medium|low", "cause": "<explication>"}},
+    {{"timestamp_seconds": <int>, "severity": "high|medium|low", "cause": "<explication>"}},
+    {{"timestamp_seconds": <int>, "severity": "high|medium|low", "cause": "<explication>"}}
   ],
-  "audience_loss_estimate": "<estimation qualitative ex: ~50% entre 5s et 15s>",
+  "audience_loss_estimate": "<estimation qualitative ex: ~40% entre 8s et 15s>",
   "corrective_actions": ["<action 1>", "<action 2>", "<action 3>"]
 }}
 
-RÈGLES ABSOLUES:
+RÈGLES IMPÉRATIVES :
 - Scores > 8/10 sont exceptionnels et doivent être justifiés
 - Baser l'analyse sur les données réelles du transcript et des frames
-- corrective_actions = pour les PROCHAINES vidéos UNIQUEMENT
+- corrective_actions = pour les PROCHAINES vidéos uniquement
 - Langage simple, zéro jargon marketing
 - Minimum 3 attention_drops basés sur les données réelles
-- Si mode audio uniquement, attention_drops peut être null"""
+- Répondre UNIQUEMENT avec du JSON valide, sans texte avant ni après"""
 
-    # Try llama-3.3-70b-versatile first, fallback to llama3-70b-8192
-    for model in ["llama-3.3-70b-versatile", "llama3-70b-8192"]:
-        try:
-            response = groq_client.chat.completions.create(
-                model=model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Tu es un expert en rétention d'audience. Réponds uniquement en JSON valide, sans markdown.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=1500,
-            )
-            content = response.choices[0].message.content.strip()
-            if content.startswith("```"):
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-            return json.loads(content.strip())
-        except Exception as e:
-            if model == "llama3-70b-8192":
-                raise
-            continue
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1500,
+    )
 
-    raise ValueError("Diagnostic generation failed on all models")
+    content = response.choices[0].message.content.strip()
+    # Nettoyer les balises markdown si présentes
+    if content.startswith("```"):
+        content = content.split("```")[1]
+        if content.startswith("json"):
+            content = content[4:]
+    return json.loads(content.strip())
 
-# ─── Async Pipeline ───────────────────────────────────────────────────────────
+
+# ─── Pipeline asynchrone ──────────────────────────────────────────────────────
 async def run_pipeline(job_id: str, request: AnalyzeRequest):
     file_path = None
     try:
+        # ÉTAPE 1 — Téléchargement
         jobs[job_id]["progress"] = "downloading"
         jobs[job_id]["message"] = "Téléchargement de la vidéo via RapidAPI..."
         loop = asyncio.get_event_loop()
         file_path, mode = await loop.run_in_executor(
             None, download_tiktok_via_rapidapi, request.url
         )
+        jobs[job_id]["mode"] = mode
 
+        # ÉTAPE 2 — Transcription
         jobs[job_id]["progress"] = "transcribing"
         jobs[job_id]["message"] = "Transcription audio via Groq Whisper..."
         transcript = await loop.run_in_executor(None, transcribe_audio, file_path)
 
-        visual_signals = None
+        # ÉTAPE 3 — Analyse visuelle (seulement en mode vidéo)
+        visual_signals = []
         if mode == "video":
             jobs[job_id]["progress"] = "analyzing_frames"
             jobs[job_id]["message"] = "Analyse image par image via Groq Vision..."
             visual_signals = await loop.run_in_executor(None, analyze_frames, file_path)
 
+        # ÉTAPE 4 — Génération du diagnostic
         jobs[job_id]["progress"] = "generating_diagnostic"
-        jobs[job_id]["message"] = "Génération du diagnostic Attentiq via Groq LLM..."
+        jobs[job_id]["message"] = "Génération du diagnostic Attentiq..."
         diagnostic = await loop.run_in_executor(
-            None, generate_diagnostic, transcript, visual_signals or [], request.url
+            None, generate_diagnostic, transcript, visual_signals, request.url
         )
 
+        # Résultat final
         jobs[job_id]["status"] = "success"
         jobs[job_id]["progress"] = "done"
         jobs[job_id]["message"] = "Analyse terminée."
@@ -355,9 +418,12 @@ async def run_pipeline(job_id: str, request: AnalyzeRequest):
             "request_id": request.request_id or job_id,
             "status": "success" if mode == "video" else "partial",
             "mode": mode,
-            "metadata": {"url": request.url, "platform": request.platform},
+            "metadata": {
+                "url": request.url,
+                "platform": request.platform,
+            },
             "transcript": transcript,
-            "visual_signals": visual_signals,
+            "visual_signals": visual_signals if visual_signals else None,
             "diagnostic": diagnostic,
         }
 
@@ -366,9 +432,12 @@ async def run_pipeline(job_id: str, request: AnalyzeRequest):
         jobs[job_id]["progress"] = "failed"
         jobs[job_id]["error_message"] = str(e)
         jobs[job_id]["message"] = f"Erreur: {str(e)}"
+        print(f"[ERROR] job {job_id}: {e}")
+
     finally:
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
+
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 @app.post("/analyze")
@@ -380,6 +449,7 @@ async def analyze(request: AnalyzeRequest, background_tasks: BackgroundTasks):
         "message": "Job créé, démarrage imminent...",
         "result": None,
         "error_message": None,
+        "mode": None,
     }
     background_tasks.add_task(run_pipeline, job_id, request)
     return {
@@ -395,8 +465,14 @@ async def get_job(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job introuvable")
     job = jobs[job_id]
+
     if job["status"] == "success":
-        return {"job_id": job_id, "status": "success", "progress": "done", "result": job["result"]}
+        return {
+            "job_id": job_id,
+            "status": "success",
+            "progress": "done",
+            "result": job["result"],
+        }
     elif job["status"] == "error":
         return {
             "job_id": job_id,
