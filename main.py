@@ -56,6 +56,39 @@ async def download_file(url: str, suffix: str = ".mp4") -> str:
     return local_path
 
 
+async def download_tiktok_via_ytdlp(tiktok_url: str) -> tuple:
+    """
+    Primary extraction method using yt-dlp.
+    Returns (file_path, mode) where mode is "video" or "audio_only".
+    Downloads the best available video (no watermark preferred) to a temp file.
+    """
+    output_path = f"/tmp/{uuid.uuid4()}.mp4"
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--merge-output-format", "mp4",
+        "--output", output_path,
+        "--quiet",
+        "--no-warnings",
+        tiktok_url,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        if proc.returncode != 0:
+            raise ValueError(f"yt-dlp exited {proc.returncode}: {stderr.decode()[:300]}")
+        if not os.path.exists(output_path) or os.path.getsize(output_path) < 10000:
+            raise ValueError(f"yt-dlp produced no usable file (size={os.path.getsize(output_path) if os.path.exists(output_path) else 0} bytes)")
+        print(f"[OK] yt-dlp downloaded video ({os.path.getsize(output_path)} bytes)")
+        return output_path, "video"
+    except asyncio.TimeoutError:
+        raise ValueError("yt-dlp timed out after 120s")
+
+
 async def download_tiktok_via_rapidapi(tiktok_url: str) -> tuple:
     """
     Returns (file_path, mode) where mode is "video" or "audio_only".
@@ -261,19 +294,58 @@ RÈGLES:
 async def run_pipeline(job_id: str, request: AnalyzeRequest):
     media_path = None
     try:
-        jobs[job_id]["progress"] = "downloading"
-        jobs[job_id]["message"] = "Téléchargement de la vidéo via RapidAPI..."
         loop = asyncio.get_event_loop()
-        media_path, download_mode = await download_tiktok_via_rapidapi(request.url)
 
+        # ── Step 1: Download — yt-dlp primary, RapidAPI fallback ──────────────
+        jobs[job_id]["progress"] = "downloading"
+        jobs[job_id]["message"] = "Téléchargement de la vidéo via yt-dlp..."
+        download_mode = None
+
+        try:
+            media_path, download_mode = await download_tiktok_via_ytdlp(request.url)
+            print(f"[PIPELINE] yt-dlp succeeded for {request.url}")
+        except Exception as ytdlp_err:
+            print(f"[PIPELINE] yt-dlp failed ({ytdlp_err}), trying RapidAPI fallback...")
+            jobs[job_id]["message"] = "yt-dlp indisponible, tentative via RapidAPI..."
+            try:
+                media_path, download_mode = await download_tiktok_via_rapidapi(request.url)
+                print(f"[PIPELINE] RapidAPI fallback succeeded for {request.url}")
+            except Exception as rapid_err:
+                print(f"[PIPELINE] RapidAPI fallback also failed ({rapid_err}), falling back to metadata-only.")
+                # Metadata-only: no media file, produce a minimal diagnostic
+                jobs[job_id]["status"] = "success"
+                jobs[job_id]["progress"] = "done"
+                jobs[job_id]["message"] = "Analyse terminée (métadonnées uniquement — téléchargement impossible)."
+                jobs[job_id]["result"] = {
+                    "request_id": request.request_id or job_id,
+                    "status": "metadata_only",
+                    "download_mode": "none",
+                    "metadata": {"url": request.url, "platform": request.platform},
+                    "transcript": [],
+                    "visual_signals": [],
+                    "diagnostic": {
+                        "retention_score": None,
+                        "global_summary": "Téléchargement impossible — analyse basée sur les métadonnées uniquement.",
+                        "drop_off_rule": "N/A",
+                        "creator_perception": "N/A",
+                        "attention_drops": [],
+                        "audience_loss_estimate": "N/A",
+                        "corrective_actions": [],
+                        "errors": {
+                            "ytdlp": str(ytdlp_err),
+                            "rapidapi": str(rapid_err),
+                        },
+                    },
+                }
+                return
+
+        # ── Step 2: Transcribe ─────────────────────────────────────────────────
         jobs[job_id]["progress"] = "transcribing"
         jobs[job_id]["message"] = "Transcription audio via Whisper..."
 
         if media_path.endswith(".mp3"):
             transcript = await loop.run_in_executor(None, transcribe_audio_from_mp3, media_path)
             visual_signals = []  # pas de frames disponibles
-            jobs[job_id]["result"] = jobs[job_id].get("result") or {}
-            jobs[job_id]["result"]["status"] = "partial"
             final_status = "partial"
         else:
             transcript = await loop.run_in_executor(None, transcribe_audio, media_path)
@@ -282,6 +354,7 @@ async def run_pipeline(job_id: str, request: AnalyzeRequest):
             visual_signals = await loop.run_in_executor(None, analyze_frames, media_path)
             final_status = "success"
 
+        # ── Step 3: Diagnostic ─────────────────────────────────────────────────
         jobs[job_id]["progress"] = "generating_diagnostic"
         jobs[job_id]["message"] = "Génération du diagnostic Attentiq..."
         diagnostic = await loop.run_in_executor(None, generate_diagnostic, transcript, visual_signals, request.url)
