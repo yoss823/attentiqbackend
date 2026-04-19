@@ -412,3 +412,32 @@ async def get_job(job_id: str):
         return {"job_id": job_id, "status": "error", "progress": "failed", "error_message": job.get("error_message", "Erreur inconnue")}
     else:
         return {"job_id": job_id, "status": "processing", "progress": job.get("progress", "unknown"), "message": job.get("message", "")}
+
+
+@app.get("/debug/rapidapi")
+async def debug_rapidapi():
+    """Test RapidAPI connectivity from Railway"""
+    headers_api = {
+        "x-rapidapi-host": "tiktok-download-video-no-watermark.p.rapidapi.com",
+        "x-rapidapi-key": RAPIDAPI_KEY,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            response = await c.get(
+                "https://tiktok-download-video-no-watermark.p.rapidapi.com/tiktok/info",
+                headers=headers_api,
+                params={"url": "https://www.tiktok.com/@test/video/1234567890123456789", "hd": "1"},
+            )
+        return {
+            "status": "connected",
+            "http_status": response.status_code,
+            "rapidapi_key_set": bool(RAPIDAPI_KEY),
+            "response_keys": list(response.json().keys()) if response.headers.get("content-type", "").startswith("application/json") else "not_json"
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_type": type(e).__name__,
+            "error": str(e),
+            "rapidapi_key_set": bool(RAPIDAPI_KEY),
+        }
