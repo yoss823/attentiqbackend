@@ -208,40 +208,96 @@ def transcribe_audio_from_mp3(mp3_path: str) -> list:
 
 
 def analyze_frames(mp4_path: str) -> list:
+    import json, shutil
     frames_dir = f"/tmp/frames_{uuid.uuid4()}"
     os.makedirs(frames_dir, exist_ok=True)
-    subprocess.run(
-        ["ffmpeg", "-i", mp4_path, "-vf", "fps=1/5", f"{frames_dir}/frame_%04d.jpg", "-y"],
-        capture_output=True, check=True
-    )
-    frames = sorted([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
-    visual_signals = []
-    for i, frame_file in enumerate(frames[:12]):
-        frame_path = os.path.join(frames_dir, frame_file)
-        with open(frame_path, "rb") as f:
-            img_b64 = base64.b64encode(f.read()).decode()
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Analyse cette frame de vidéo TikTok. Réponds en JSON avec les champs: face_expression (str), body_position (str), on_screen_text (str), motion_level (low|medium|high), scene_change (bool)"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-                ]
-            }],
-            max_tokens=200
+    print(f"[FRAMES] Starting frame extraction from {mp4_path}")
+
+    # Probe video duration so we can sample at 0%, 33%, 66%, 100%
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", mp4_path],
+            capture_output=True, text=True, timeout=15
         )
+        duration = float(probe.stdout.strip())
+    except Exception as e:
+        print(f"[FRAMES] ffprobe failed ({e}), defaulting duration to 30s")
+        duration = 30.0
+
+    print(f"[FRAMES] Video duration: {duration:.1f}s")
+
+    # Build 4 evenly-spaced timestamps: 0%, 33%, 66%, 100%
+    NUM_FRAMES = 4
+    if duration <= 0:
+        timestamps = [0.0, 1.0, 2.0, 3.0]
+    else:
+        timestamps = [duration * i / (NUM_FRAMES - 1) for i in range(NUM_FRAMES)]
+        # Clamp the last timestamp slightly inside the file to avoid EOF errors
+        timestamps[-1] = max(0.0, duration - 0.5)
+
+    print(f"[FRAMES] Sampling {NUM_FRAMES} frames at timestamps: {[f'{t:.1f}s' for t in timestamps]}")
+
+    # Extract one JPEG per timestamp using ffmpeg -ss seek
+    frame_paths = []
+    for idx, ts in enumerate(timestamps):
+        frame_path = os.path.join(frames_dir, f"frame_{idx:04d}.jpg")
+        result = subprocess.run(
+            ["ffmpeg", "-ss", str(ts), "-i", mp4_path,
+             "-frames:v", "1", "-q:v", "3", frame_path, "-y"],
+            capture_output=True, timeout=30
+        )
+        if result.returncode == 0 and os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
+            frame_paths.append((idx, ts, frame_path))
+            print(f"[FRAMES] Extracted frame {idx+1}/{NUM_FRAMES} at {ts:.1f}s ({os.path.getsize(frame_path)} bytes)")
+        else:
+            print(f"[FRAMES] WARNING: Failed to extract frame {idx+1}/{NUM_FRAMES} at {ts:.1f}s — skipping")
+
+    print(f"[FRAMES] {len(frame_paths)} frames extracted, starting GPT-4o-mini Vision analysis...")
+
+    visual_signals = []
+    for frame_idx, (idx, ts, frame_path) in enumerate(frame_paths):
+        print(f"[FRAMES] Analyzing frame {frame_idx+1}/{len(frame_paths)} at {ts:.1f}s with GPT-4o-mini...")
+        t0 = time.time()
         try:
-            import json
+            with open(frame_path, "rb") as f:
+                img_b64 = base64.b64encode(f.read()).decode()
+
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Analyse cette frame de vidéo TikTok. Réponds en JSON avec les champs: face_expression (str), body_position (str), on_screen_text (str), motion_level (low|medium|high), scene_change (bool)"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "low"}}
+                    ]
+                }],
+                max_tokens=200,
+                timeout=45,
+            )
+            elapsed = time.time() - t0
             content = response.choices[0].message.content
-            signal = json.loads(content.strip("```json\n").strip("```"))
-        except:
+            print(f"[FRAMES] Frame {frame_idx+1} GPT response received in {elapsed:.1f}s")
+            try:
+                signal = json.loads(content.strip("```json\n").strip("```").strip())
+            except Exception as parse_err:
+                print(f"[FRAMES] Frame {frame_idx+1} JSON parse failed ({parse_err}), using fallback")
+                signal = {"face_expression": "unknown", "body_position": "unknown", "on_screen_text": "", "motion_level": "medium", "scene_change": False}
+        except Exception as e:
+            elapsed = time.time() - t0
+            print(f"[FRAMES] Frame {frame_idx+1} GPT call failed after {elapsed:.1f}s: {type(e).__name__}: {e} — using fallback")
             signal = {"face_expression": "unknown", "body_position": "unknown", "on_screen_text": "", "motion_level": "medium", "scene_change": False}
-        signal["timestamp_seconds"] = i * 5
+        finally:
+            if os.path.exists(frame_path):
+                os.remove(frame_path)
+
+        signal["timestamp_seconds"] = round(ts, 1)
         visual_signals.append(signal)
-        os.remove(frame_path)
-    os.rmdir(frames_dir)
+
+    shutil.rmtree(frames_dir, ignore_errors=True)
+    print(f"[FRAMES] Frame analysis complete: {len(visual_signals)} signals produced")
     return visual_signals
+
 
 
 def generate_diagnostic(transcript: list, visual_signals: list, url: str = "") -> dict:
@@ -293,25 +349,29 @@ RÈGLES:
 
 async def run_pipeline(job_id: str, request: AnalyzeRequest):
     media_path = None
+    t_pipeline_start = time.time()
     try:
         loop = asyncio.get_event_loop()
+        print(f"[PIPELINE] Job {job_id} started for URL: {request.url}")
 
         # ── Step 1: Download — yt-dlp primary, RapidAPI fallback ──────────────
         jobs[job_id]["progress"] = "downloading"
         jobs[job_id]["message"] = "Téléchargement de la vidéo via yt-dlp..."
         download_mode = None
+        t0 = time.time()
 
         try:
             media_path, download_mode = await download_tiktok_via_ytdlp(request.url)
-            print(f"[PIPELINE] yt-dlp succeeded for {request.url}")
+            print(f"[PIPELINE] Step 1/4 DONE — yt-dlp download succeeded in {time.time()-t0:.1f}s ({os.path.getsize(media_path)} bytes)")
         except Exception as ytdlp_err:
-            print(f"[PIPELINE] yt-dlp failed ({ytdlp_err}), trying RapidAPI fallback...")
+            print(f"[PIPELINE] yt-dlp failed after {time.time()-t0:.1f}s ({ytdlp_err}), trying RapidAPI fallback...")
             jobs[job_id]["message"] = "yt-dlp indisponible, tentative via RapidAPI..."
+            t0 = time.time()
             try:
                 media_path, download_mode = await download_tiktok_via_rapidapi(request.url)
-                print(f"[PIPELINE] RapidAPI fallback succeeded for {request.url}")
+                print(f"[PIPELINE] Step 1/4 DONE — RapidAPI fallback succeeded in {time.time()-t0:.1f}s ({os.path.getsize(media_path)} bytes)")
             except Exception as rapid_err:
-                print(f"[PIPELINE] RapidAPI fallback also failed ({rapid_err}), falling back to metadata-only.")
+                print(f"[PIPELINE] RapidAPI fallback also failed after {time.time()-t0:.1f}s ({rapid_err}), falling back to metadata-only.")
                 # Metadata-only: no media file, produce a minimal diagnostic
                 jobs[job_id]["status"] = "success"
                 jobs[job_id]["progress"] = "done"
@@ -342,22 +402,38 @@ async def run_pipeline(job_id: str, request: AnalyzeRequest):
         # ── Step 2: Transcribe ─────────────────────────────────────────────────
         jobs[job_id]["progress"] = "transcribing"
         jobs[job_id]["message"] = "Transcription audio via Whisper..."
+        print(f"[PIPELINE] Step 2/4 — Starting Whisper transcription (mode={download_mode})...")
+        t0 = time.time()
 
         if media_path.endswith(".mp3"):
             transcript = await loop.run_in_executor(None, transcribe_audio_from_mp3, media_path)
             visual_signals = []  # pas de frames disponibles
             final_status = "partial"
+            print(f"[PIPELINE] Step 2/4 DONE — Whisper transcription (mp3) in {time.time()-t0:.1f}s, {len(transcript)} segments")
+            print(f"[PIPELINE] Step 3/4 — Skipping frame analysis (audio-only mode)")
         else:
             transcript = await loop.run_in_executor(None, transcribe_audio, media_path)
+            print(f"[PIPELINE] Step 2/4 DONE — Whisper transcription in {time.time()-t0:.1f}s, {len(transcript)} segments")
+
+            # ── Step 3: Frame analysis ─────────────────────────────────────────
             jobs[job_id]["progress"] = "analyzing_frames"
-            jobs[job_id]["message"] = "Analyse image par image via GPT-4o Vision..."
+            jobs[job_id]["message"] = "Analyse de 4 frames clés via GPT-4o-mini Vision..."
+            print(f"[PIPELINE] Step 3/4 — Starting frame analysis (4 frames, GPT-4o-mini)...")
+            t0 = time.time()
             visual_signals = await loop.run_in_executor(None, analyze_frames, media_path)
+            print(f"[PIPELINE] Step 3/4 DONE — Frame analysis in {time.time()-t0:.1f}s, {len(visual_signals)} signals")
             final_status = "success"
 
-        # ── Step 3: Diagnostic ─────────────────────────────────────────────────
+        # ── Step 4: Diagnostic ─────────────────────────────────────────────────
         jobs[job_id]["progress"] = "generating_diagnostic"
         jobs[job_id]["message"] = "Génération du diagnostic Attentiq..."
+        print(f"[PIPELINE] Step 4/4 — Generating diagnostic with GPT-4o...")
+        t0 = time.time()
         diagnostic = await loop.run_in_executor(None, generate_diagnostic, transcript, visual_signals, request.url)
+        print(f"[PIPELINE] Step 4/4 DONE — Diagnostic generated in {time.time()-t0:.1f}s")
+
+        total_elapsed = time.time() - t_pipeline_start
+        print(f"[PIPELINE] Job {job_id} COMPLETE in {total_elapsed:.1f}s total (status={final_status})")
 
         jobs[job_id]["status"] = "success"
         jobs[job_id]["progress"] = "done"
@@ -373,6 +449,8 @@ async def run_pipeline(job_id: str, request: AnalyzeRequest):
         }
 
     except Exception as e:
+        elapsed = time.time() - t_pipeline_start
+        print(f"[PIPELINE] Job {job_id} FAILED after {elapsed:.1f}s: {type(e).__name__}: {e}")
         jobs[job_id]["status"] = "error"
         jobs[job_id]["progress"] = "failed"
         jobs[job_id]["error_message"] = str(e)
@@ -380,6 +458,7 @@ async def run_pipeline(job_id: str, request: AnalyzeRequest):
     finally:
         if media_path and os.path.exists(media_path):
             os.remove(media_path)
+
 
 
 @app.post("/analyze")
