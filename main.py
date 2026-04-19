@@ -234,7 +234,7 @@ def analyze_frames(mp4_path: str) -> list:
         with open(frame_path, "rb") as f:
             img_b64 = base64.b64encode(f.read()).decode()
         response = claude_client.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-3-opus-20240229",
             max_tokens=200,
             messages=[{
                 "role": "user",
@@ -305,13 +305,13 @@ RÈGLES:
 
     if visual_signals:
         response = claude_client.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-3-opus-20240229",
             max_tokens=1000,
             messages=[{"role": "user", "content": prompt}]
         )
     else:
         response = claude_client.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-3-opus-20240229",
             max_tokens=1000,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -538,7 +538,7 @@ async def debug_ai():
         try:
             test_claude = anthropic.Anthropic(api_key=anthropic_key)
             response = test_claude.messages.create(
-                model="claude-3-5-sonnet-20241022",
+                model="claude-3-opus-20240229",
                 max_tokens=10,
                 messages=[{"role": "user", "content": "ping"}]
             )
