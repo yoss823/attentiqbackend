@@ -83,7 +83,8 @@ async def download_tiktok_via_rapidapi(tiktok_url: str) -> tuple:
     response.raise_for_status()
     data = response.json()
 
-    if data.get("code") != 0:
+    # code field may be absent in some RapidAPI response formats
+    if "code" in data and data["code"] != 0:
         raise ValueError(f"RapidAPI error: {data}")
 
     data_obj = data.get("data", {})
