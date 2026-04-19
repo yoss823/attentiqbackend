@@ -89,15 +89,15 @@ def _clean_tiktok_url(url: str) -> str:
 
 def _call_rapidapi(tiktok_url: str) -> dict:
     """
-    Appelle RapidAPI tiktok-download-without-watermark.
+    Appelle RapidAPI tiktok-download-video-no-watermark.
     Gère les deux formats de réponse :
       - Format A : {"code": 0, "data": {...}}
       - Format B : {"link": "...", "data": {...}}  (pas de champ "code")
     """
-    api_url = "https://tiktok-download-without-watermark.p.rapidapi.com/analysis"
+    api_url = "https://tiktok-download-video-no-watermark.p.rapidapi.com/tiktok/info"
     headers = {
         "X-RapidAPI-Key": RAPIDAPI_KEY,
-        "X-RapidAPI-Host": "tiktok-download-without-watermark.p.rapidapi.com",
+        "X-RapidAPI-Host": "tiktok-download-video-no-watermark.p.rapidapi.com",
     }
     params = {"url": tiktok_url, "hd": "0"}
 
@@ -108,16 +108,6 @@ def _call_rapidapi(tiktok_url: str) -> dict:
     # Vérifier le code SEULEMENT s'il est explicitement présent et non nul
     code = data.get("code")
     if code is not None and code != 0:
-        # Retry avec URL nettoyée
-        clean_url = _clean_tiktok_url(tiktok_url)
-        if clean_url != tiktok_url:
-            params["url"] = clean_url
-            r2 = requests.get(api_url, headers=headers, params=params, timeout=30)
-            r2.raise_for_status()
-            data2 = r2.json()
-            code2 = data2.get("code")
-            if code2 is None or code2 == 0:
-                return data2
         raise ValueError(f"RapidAPI error code {code}: {data.get('msg', 'unknown error')}")
 
     return data
