@@ -74,14 +74,25 @@ async def download_tiktok_via_rapidapi(tiktok_url: str) -> tuple:
     }
     params = {"url": tiktok_url, "hd": "1"}
 
-    async with httpx.AsyncClient(timeout=30.0) as c:
-        response = await c.get(
-            "https://tiktok-download-video-no-watermark.p.rapidapi.com/tiktok/info",
-            headers=headers_api,
-            params=params,
-        )
-    response.raise_for_status()
-    data = response.json()
+    last_api_error = None
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as c:
+                response = await c.get(
+                    "https://tiktok-download-video-no-watermark.p.rapidapi.com/tiktok/info",
+                    headers=headers_api,
+                    params=params,
+                )
+            response.raise_for_status()
+            data = response.json()
+            break
+        except Exception as e:
+            last_api_error = e
+            print(f"[RETRY {attempt+1}/3] RapidAPI call failed: {type(e).__name__}: {e}")
+            if attempt < 2:
+                await asyncio.sleep(2)
+    else:
+        raise ValueError(f"RapidAPI unreachable after 3 attempts: {last_api_error}")
 
     # code field may be absent in some RapidAPI response formats
     if "code" in data and data["code"] != 0:
