@@ -12,6 +12,16 @@ app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 jobs = {}
 
+MOBILE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Referer": "https://www.tiktok.com/",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Range": "bytes=0-",
+}
+
 
 class AnalyzeRequest(BaseModel):
     request_id: Optional[str] = None
@@ -26,52 +36,94 @@ def health():
     return {"status": "ok"}
 
 
-async def download_tiktok_via_rapidapi(tiktok_url: str) -> str:
+async def download_file(url: str, suffix: str = ".mp4") -> str:
+    local_path = f"/tmp/{uuid.uuid4()}{suffix}"
+    async with httpx.AsyncClient(
+        headers=MOBILE_HEADERS,
+        follow_redirects=True,
+        timeout=60.0
+    ) as client:
+        async with client.stream("GET", url) as response:
+            response.raise_for_status()
+            with open(local_path, "wb") as f:
+                async for chunk in response.aiter_bytes(chunk_size=8192):
+                    f.write(chunk)
+
+    file_size = os.path.getsize(local_path)
+    if file_size < 10000:
+        raise ValueError(f"Fichier trop petit ({file_size} bytes) — CDN bloqué")
+
+    return local_path
+
+
+async def download_tiktok_via_rapidapi(tiktok_url: str) -> tuple:
+    """
+    Returns (file_path, mode) where mode is "video" or "audio_only".
+    Tries all available video URLs from RapidAPI with mobile headers,
+    falls back to audio-only if all video URLs fail.
+    """
     # Resolve short URL if necessary
     if "vt.tiktok.com" in tiktok_url or len(tiktok_url) < 60:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            r = await client.head(tiktok_url)
+        async with httpx.AsyncClient(follow_redirects=True) as c:
+            r = await c.head(tiktok_url)
             tiktok_url = str(r.url)
 
-    headers = {
+    headers_api = {
         "x-rapidapi-host": "tiktok-download-video-no-watermark.p.rapidapi.com",
         "x-rapidapi-key": RAPIDAPI_KEY,
     }
     params = {"url": tiktok_url, "hd": "1"}
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(
+    async with httpx.AsyncClient(timeout=30.0) as c:
+        response = await c.get(
             "https://tiktok-download-video-no-watermark.p.rapidapi.com/tiktok/info",
-            headers=headers,
+            headers=headers_api,
             params=params,
         )
     response.raise_for_status()
     data = response.json()
 
+    if data.get("code") != 0:
+        raise ValueError(f"RapidAPI error: {data}")
+
     data_obj = data.get("data", {})
-    video_url = (
-        data_obj.get("play") or
-        data_obj.get("video_link_nwm") or
-        data_obj.get("nwm_video_url_HQ") or
-        data_obj.get("wmplay")
-    )
+    video_candidates = [
+        data_obj.get("play"),
+        data_obj.get("hdplay"),
+        data_obj.get("video_link_nwm"),
+        data_obj.get("wmplay"),
+    ]
+    audio_url = data_obj.get("music") or data_obj.get("audio")
 
-    if not video_url:
-        raise ValueError(f"Impossible d'extraire l'URL MP4 depuis RapidAPI. Réponse: {data}")
+    # Tenter chaque URL vidéo
+    mp4_path = None
+    last_error = None
+    for url_candidate in video_candidates:
+        if not url_candidate:
+            continue
+        try:
+            mp4_path = await download_file(url_candidate, ".mp4")
+            print(f"[OK] Video downloaded from {url_candidate[:60]}... ({os.path.getsize(mp4_path)} bytes)")
+            break  # succès
+        except Exception as e:
+            last_error = e
+            print(f"[FAIL] Video URL failed: {e}")
+            continue
 
-    local_path = f"/tmp/{uuid.uuid4()}.mp4"
-    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-        async with client.stream("GET", video_url) as mp4_response:
-            mp4_response.raise_for_status()
-            with open(local_path, "wb") as f:
-                async for chunk in mp4_response.aiter_bytes(chunk_size=8192):
-                    f.write(chunk)
+    # Fallback : si toutes les URLs vidéo échouent, utiliser l'audio seul
+    if mp4_path is None and audio_url:
+        try:
+            mp4_path = await download_file(audio_url, ".mp3")
+            print(f"[OK] Audio-only downloaded ({os.path.getsize(mp4_path)} bytes)")
+            return mp4_path, "audio_only"
+        except Exception as e:
+            last_error = e
+            print(f"[FAIL] Audio URL failed: {e}")
 
-    file_size = os.path.getsize(local_path)
-    if file_size < 10000:
-        raise ValueError(f"Fichier MP4 trop petit ({file_size} bytes) — téléchargement probablement échoué")
+    if mp4_path is None:
+        raise ValueError(f"Impossible de télécharger la vidéo. Dernière erreur: {last_error}")
 
-    return local_path
+    return mp4_path, "video"
 
 
 def transcribe_audio(mp4_path: str) -> list:
@@ -88,6 +140,21 @@ def transcribe_audio(mp4_path: str) -> list:
             timestamp_granularities=["segment"]
         )
     os.remove(audio_path)
+    segments = []
+    if hasattr(transcript, "segments") and transcript.segments:
+        for seg in transcript.segments:
+            segments.append({"start": seg.start, "end": seg.end, "text": seg.text})
+    return segments
+
+
+def transcribe_audio_from_mp3(mp3_path: str) -> list:
+    with open(mp3_path, "rb") as f:
+        transcript = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=f,
+            response_format="verbose_json",
+            timestamp_granularities=["segment"]
+        )
     segments = []
     if hasattr(transcript, "segments") and transcript.segments:
         for seg in transcript.segments:
@@ -135,7 +202,7 @@ def analyze_frames(mp4_path: str) -> list:
 def generate_diagnostic(transcript: list, visual_signals: list, url: str = "") -> dict:
     import json
     transcript_text = " | ".join([f"[{s['start']:.1f}s] {s['text']}" for s in transcript]) if transcript else "Aucun transcript disponible"
-    visual_text = json.dumps(visual_signals[:6], ensure_ascii=False) if visual_signals else "Aucun signal visuel"
+    visual_text = json.dumps(visual_signals[:6], ensure_ascii=False) if visual_signals else "Aucun signal visuel (mode audio seulement)"
 
     prompt = f"""Tu es un expert en rétention d'attention pour les vidéos courtes (TikTok, Reels, Shorts).
 
@@ -180,20 +247,28 @@ RÈGLES:
 
 
 async def run_pipeline(job_id: str, request: AnalyzeRequest):
-    mp4_path = None
+    media_path = None
     try:
         jobs[job_id]["progress"] = "downloading"
         jobs[job_id]["message"] = "Téléchargement de la vidéo via RapidAPI..."
         loop = asyncio.get_event_loop()
-        mp4_path = await download_tiktok_via_rapidapi(request.url)
+        media_path, download_mode = await download_tiktok_via_rapidapi(request.url)
 
         jobs[job_id]["progress"] = "transcribing"
         jobs[job_id]["message"] = "Transcription audio via Whisper..."
-        transcript = await loop.run_in_executor(None, transcribe_audio, mp4_path)
 
-        jobs[job_id]["progress"] = "analyzing_frames"
-        jobs[job_id]["message"] = "Analyse image par image via GPT-4o Vision..."
-        visual_signals = await loop.run_in_executor(None, analyze_frames, mp4_path)
+        if media_path.endswith(".mp3"):
+            transcript = await loop.run_in_executor(None, transcribe_audio_from_mp3, media_path)
+            visual_signals = []  # pas de frames disponibles
+            jobs[job_id]["result"] = jobs[job_id].get("result") or {}
+            jobs[job_id]["result"]["status"] = "partial"
+            final_status = "partial"
+        else:
+            transcript = await loop.run_in_executor(None, transcribe_audio, media_path)
+            jobs[job_id]["progress"] = "analyzing_frames"
+            jobs[job_id]["message"] = "Analyse image par image via GPT-4o Vision..."
+            visual_signals = await loop.run_in_executor(None, analyze_frames, media_path)
+            final_status = "success"
 
         jobs[job_id]["progress"] = "generating_diagnostic"
         jobs[job_id]["message"] = "Génération du diagnostic Attentiq..."
@@ -204,7 +279,8 @@ async def run_pipeline(job_id: str, request: AnalyzeRequest):
         jobs[job_id]["message"] = "Analyse terminée."
         jobs[job_id]["result"] = {
             "request_id": request.request_id or job_id,
-            "status": "success",
+            "status": final_status,
+            "download_mode": download_mode,
             "metadata": {"url": request.url, "platform": request.platform},
             "transcript": transcript,
             "visual_signals": visual_signals,
@@ -217,8 +293,8 @@ async def run_pipeline(job_id: str, request: AnalyzeRequest):
         jobs[job_id]["error_message"] = str(e)
         jobs[job_id]["message"] = f"Erreur: {str(e)}"
     finally:
-        if mp4_path and os.path.exists(mp4_path):
-            os.remove(mp4_path)
+        if media_path and os.path.exists(media_path):
+            os.remove(media_path)
 
 
 @app.post("/analyze")
